@@ -1,6 +1,6 @@
 ;;; -*- Mode: LISP; Syntax: COMMON-LISP; Package: TURING; Base: 10 -*-
 ;;;
-;;;  (c) copyright 2009 by
+;;;  (c) copyright 2009-2010 by
 ;;;           Samium Gromoff (_deepfire@feelingofgreen.ru)
 ;;;
 ;;; This library is free software; you can redistribute it and/or
@@ -26,6 +26,296 @@
   (define-condition comp-condition () ())
   (define-condition comp-error (error comp-condition) ())
   (define-simple-error comp-error))
+
+;;;;
+;;;; Operands
+;;;;
+(defclass constant () ((value :reader value :initarg :value)))
+(defclass variable () ((varname :reader varname :initarg :varname)))
+(defclass symbol (variable constant) ())
+(defclass typename () ((typename :reader typename :initarg :typename)))
+(defclass operand (variable constant typename) ())
+
+(define-protocol-class register () ((regname :reader regname :initarg :regname)))
+(defclass integer-register (register) ())
+(defclass floating-point-register (register) ())
+(defclass symbolic-register (register) ())
+(defclass lir-operand (register constant typename) ())
+
+(defun make-constant (value)                     (make-instance 'constant :value value))
+(defun make-variable (varname)                   (make-instance 'variable :varname varname))
+(defun make-integer-register (regname)           (make-instance 'integer-register :regname regname))
+(defun make-floating-point-register (regname)    (make-instance 'floating-point-register :regname regname))
+(defun make-symbolic-register (regname)          (make-instance 'symbolic-register :regname regname))
+(defun make-symbol (varname value)               (make-instance 'symbol :varname varname :value value))
+(defun make-operand (varname value typename)     (make-instance 'operand :varname varname :value value :typename typename))
+(defun make-lir-operand (regname value typename) (make-instance 'lir-operand :regname regname :value value :typename typename))
+
+;;;;
+;;;; Operators
+;;;;
+(defclass operator ()
+  ((sym :reader op-sym :allocation :class :initarg :sym)
+   (arity :reader op-arity :allocation :class :type (integer 1 2))))
+(defclass unary-operator (operator)  ((arity :allocation :class :initform 1)))
+(defclass binary-operator (operator) ((arity :allocation :class :initform 2)))
+
+(defmethod print-object ((o operator) stream)
+  (write-string (string-downcase (op-sym o)) stream))
+
+(defvar *ops* (make-hash-table :test 'eq)
+  "Map of short names (per Muchnick) to classes.")
+
+(define-root-container *ops* op :type operator)
+
+(defmacro define-operator (sym short-name arity name)
+  `(progn
+     (defclass ,name (,(ecase arity (1 'unary-operator) (2 'binary-operator)))
+       ((sym :allocation :class :initform ',sym)))
+     (setf (op ,short-name) (make-instance ',name))))
+(defmacro define-unary-operator (sym short-name name)  `(define-operator ,sym ,short-name 1 ,name))
+(defmacro define-binary-operator (sym short-name name) `(define-operator ,sym ,short-name 2 ,name))
+
+(define-binary-operator + :add add)
+(define-binary-operator - :sub subtract)
+(define-binary-operator * :mul multiply)
+(define-binary-operator / :div divide)
+(define-binary-operator mod :mod modulo)
+(define-binary-operator min :min minumum)
+(define-binary-operator max :max maximum)
+(define-binary-operator = :eql equality)
+(define-binary-operator != :neql not-equal)
+(define-binary-operator < :less less-than)
+(define-binary-operator <= :lseq less-or-equal)
+(define-binary-operator > :grtr greater-than)
+(define-binary-operator >= :gteq greater-of-equal)
+(define-binary-operator shl :shl shift-left)
+(define-binary-operator shr :shr shift-right)
+(define-binary-operator shra :shra shift-right-arithmetic)
+(define-binary-operator and :and logical-and)
+(define-binary-operator or :or logical-or)
+(define-binary-operator xor :xor logical-exclusive-or)
+(define-unary-operator  * :ind indirection)
+(define-binary-operator >. :elt element)
+(define-binary-operator *. :indelt element-indirection)
+(define-unary-operator  - :neg arithmetic-negation)
+(define-unary-operator  ! :not logic-negation)
+(define-unary-operator  addr :addr address-of)
+(define-unary-operator  val :val value)
+(define-binary-operator cast :cast cast)
+(define-binary-operator lind :lind indirect-assignment)
+(define-binary-operator lcond :lcond conditional-assignment)
+(define-binary-operator lindelt :lindelt indirect-element-assignment)
+(define-binary-operator lelt :lelt element-assignment)
+
+;;;;
+;;;; Instructions
+;;;;
+(defclass inst ()
+  ((has-left :reader has-left-p :type boolean :allocation :class :initarg :has-left-p)))
+
+(defclass hir-inst (inst) ())
+(defclass mir-inst (inst) ())
+(defclass lir-inst (inst) ())
+(defclass lir-memaddr-inst (lir-inst) ())
+
+(defclass inst-with-left (inst)
+  ((left :accessor inst-left :initarg :left)))
+
+(defgeneric inst-has-left-p (inst)
+  (:method ((o inst))) (:method ((o inst-with-left)) t))
+
+(defclass control-transfer-inst (inst) ())
+
+(defgeneric control-transfer-p (inst)
+  (:method ((o inst))) (:method ((o control-transfer-inst)) t))
+
+(defclass inst-kind-mixin () 
+  ((kind :initarg :kind :reader kind :allocation :class :documentation
+         "Expression kind short-hand synonim, as per Muchnick.")))
+(defclass nullary (inst-kind-mixin) ((kind :allocation :class :initform :noexp)))
+(defclass unary (inst-kind-mixin)   ((kind :allocation :class :initform :unexp)))
+(defclass binary (inst-kind-mixin)  ((kind :allocation :class :initform :binexp)))
+(defclass ternary (inst-kind-mixin)  ((kind :allocation :class :initform :ternexp)))
+(defclass listary (inst-kind-mixin) ((kind :allocation :class :initform :listexp)))
+
+(defvar *insts* (make-hash-table :test 'eq)
+  "Map of short names (per Muchnick) to classes.")
+
+(define-root-container *insts* inst :type class)
+
+(defmacro define-inst (principal-type short-name name lambda-list &optional print-spec)
+  (when-let ((unknowns (set-difference (mapcar #'ensure-car lambda-list)
+                                       '(<- &rest args label procname eltname trapno const typename
+                                         unop binop
+                                         varname varname1 varname2 operand operand1 operand2
+                                         ;; hir
+                                         subscripts operand3
+                                         ;; lir
+                                         integer integer1 integer2 regname regname1 regname2 regname3 liroperand liroperand1 liroperand2
+                                         memaddr length))))
+    (error "~@<Unknown components in IR instruction definitions:~{ ~S~}.~:@>" unknowns))
+  (let* ((left (when (find '<- lambda-list)
+                 (first lambda-list)))
+         (ctran ;; XXX
+          )
+         (normalised-lambda-list (remove '<- lambda-list))
+         (kind (cond ((find 'operand normalised-lambda-list) 'unary)
+                     ((find 'operand1 normalised-lambda-list) 'binary)
+                     ((find 'operand3 normalised-lambda-list) 'ternary)
+                     ;; Arbitrary: operand reference takes precedence over &rest wrt. determining inst arity
+                     ((find '&rest normalised-lambda-list) 'listary)
+                     (t 'nullary)))
+         (normalised-lambda-list2 (remove '&rest (nsubst 'op 'unop (nsubst 'op 'binop normalised-lambda-list))))
+         (initarg-names (mapcar (compose #'make-keyword #'symbol-name) normalised-lambda-list2)))
+    `(progn
+       (defclass ,name (,kind ,@(when left '(inst-with-left)) ,@(when ctran '(control-transfer-inst)) ,principal-type)
+         (,@(iter (for slot-name in normalised-lambda-list2)
+                  (let* ((type (case slot-name
+                                 (op 'operator)
+                                 ((args subscripts) 'list)
+                                 (const 'real)
+                                 (trapno 'integer)
+                                 ((label procname eltname typename varname varname1 varname2) 'keyword)))
+                         (accessor-name (format-symbol (symbol-package name) "INST-~A" slot-name))
+                         (initarg-name (make-keyword (symbol-name slot-name)))
+                         (final-slot-name (if (and left (member slot-name '(varname varname1) :test #'eq))
+                                              'left
+                                              slot-name)))
+                    (collect `(,final-slot-name
+                               :accessor ,accessor-name
+                               :initarg ,initarg-name
+                               ,@(when type `(:type ,type))))))))
+       (defun ,(format-symbol (symbol-package name) "MAKE-~A" name) ,normalised-lambda-list2
+         (make-instance ',name ,@(iter (for initarg in initarg-names)
+                                       (for slot in normalised-lambda-list2)
+                                       (collect initarg)
+                                       (collect slot))))
+       ,@(when print-spec
+               (destructuring-bind (control-string &rest args) (ensure-list print-spec)
+                 `((defmethod print-object ((o ,name) stream)
+                     (with-slots ,normalised-lambda-list2 o
+                       (declare (ignorable ,@normalised-lambda-list2))
+                       (format stream ,control-string ,@(or args normalised-lambda-list2)))))))
+       (setf (inst ,short-name) (find-class ',name)))))
+
+(defmacro define-hir-inst (short-name name lambda-list &optional print-spec)
+  `(define-inst hir-inst ,short-name ,name ,lambda-list ,print-spec))
+(defmacro define-mir-inst (short-name name lambda-list &optional print-spec)
+  `(define-inst mir-inst ,short-name ,name ,lambda-list ,print-spec))
+(defmacro define-lir-inst (short-name name lambda-list &optional print-spec)
+  `(define-inst lir-inst ,short-name ,name ,lambda-list ,print-spec))
+(defmacro define-lir-memaddr-inst (short-name name lambda-list &optional print-spec)
+  `(define-inst lir-memaddr-inst ,short-name ,name ,lambda-list ,print-spec))
+
+(define-hir-inst :for         for                                (varname <- operand1 operand2 operand3)               "for ~(~A~) <- ~(~A~) by ~(~A~) to ~(~A~) do")
+(define-hir-inst :endfor      endfor                             ()                                                    "endfor")
+(define-hir-inst :strbinif    binary-hir-condition               (operand1 binop operand2)                             "if ~(~A~) ~A ~(~A~) then")
+(define-hir-inst :strunif     unary-hir-condition                (unop operand)                                        "if ~A ~(~A~) then")
+(define-hir-inst :strvalif    value-hir-condition                (operand)                                             "if ~(~A~) then")
+(define-hir-inst :else        else                               ()                                                    "else")
+(define-hir-inst :endif       endif                              ()                                                    "endif")
+(define-hir-inst :arybinasgn  array-binary-assignment            (varname &rest subscripts <- operand1 binop operand2) "~(~A~)[~{, ~A~}] <- ~(~A~) ~A ~(~A~)")
+(define-hir-inst :aryunasgn   array-unary-assignment             (varname &rest subscripts <- binop operand)           "~(~A~)[~{, ~A~}] <- ~A ~(~A~)")
+(define-hir-inst :aryvalasgn  array-value-assignment             (varname &rest subscripts <- operand)                 "~(~A~)[~{, ~A~}] <- ~(~A~)")
+(define-hir-inst :aryref      array-reference                    (varname &rest subscripts)                            "~(~A~)[~{, ~A~}]")
+;;; BOOK: aryref kind unspecified (and leftness, but it's obvious)
+
+
+(define-mir-inst :label       label                              (label)                                               ":~(~A~)")
+(define-mir-inst :receive     receive                            (varname <- typename)                                 "receive ~(~A~)(~A)")
+(define-mir-inst :binasgn     binary-assignment                  (varname <- operand1 binop operand2)                  "~(~A~) <- ~(~A~) ~A ~(~A~)")
+(define-mir-inst :unasgn      unary-assignment                   (varname <- unop operand)                             "~(~A~) <- ~A ~(~A~)")
+(define-mir-inst :valasgn     value-assignment                   (varname <- operand)                                  "~(~A~) <- ~(~A~)")
+(define-mir-inst :condasgn    conditional-assignment             (varname1 <- varname2 operand)                        "~(~A~) <- (~(~A~)) ~(~A~)")
+(define-mir-inst :castasgn    cast-assignment                    (varname <- typename operand)                         "~(~A~) <- (~(~A~)) ~(~A~)")
+(define-mir-inst :indasgn     indirected-assignment              (varname <- operand)                                  "*~(~A~) <- ~(~A~)")
+(define-mir-inst :eltasgn     element-assignment                 (varname eltname <- operand)                          "~(~A~).~(~A~) <- ~(~A~)")
+(define-mir-inst :indeltasgn  indirect-element-assignment        (varname eltname <- operand)                          "*~(~A~).~(~A~) <- ~(~A~)")
+(define-mir-inst :goto        goto                               (label)                                               "goto ~(~A~)")
+(define-mir-inst :binif       binary-condition                   (operand1 binop operand2 label)                       "if ~(~A~) ~A ~(~A~) goto ~(~A~)")
+(define-mir-inst :unif        unary-condition                    (unop operand label)                                  "if ~A ~(~A~) goto ~(~A~)")
+(define-mir-inst :valif       value-condition                    (operand label)                                       "if ~(~A~) goto ~(~A~)")
+(define-mir-inst :bintrap     binary-trap                        (operand1 binop operand2 trapno)                      "if ~(~A~) ~A ~(~A~) trap #x~X")
+(define-mir-inst :untrap      unary-trap                         (unop operand trapno)                                 "if ~A ~(~A~) trap #x~X")
+(define-mir-inst :valtrap     value-trap                         (operand trapno)                                      "if ~(~A~) trap #x~X")
+(define-mir-inst :call        call                               (procname &rest args)                                 "call ~(~A~)~{ ~A~}")
+(define-mir-inst :callasgn    call-assignment                    (varname <- procname &rest args)                      "~(~A~) <- call ~(~A~)~{ ~A~}")
+(define-mir-inst :return      just-return                        ()                                                    "return")
+(define-mir-inst :retval      return-value                       (operand)                                             "return ~(~A~)")
+(define-mir-inst :sequence    memory-barrier                     ()                                                    "sequence")
+(define-mir-inst :var         variable-reference                 (varname)                                             "~(~A~)")
+(define-mir-inst :const       constant-value                     (const)                                               "~(~A~)")
+(define-mir-inst :tn          type-name                          (typename)                                            "~(~A~)")
+
+;; label skipped
+(define-lir-inst :regbin      register-binary-assignment         (regname <- liroperand1 binop liroperand2)            "~(~A~) <- ~(~A~) ~A~(~A~)")
+(define-lir-inst :regun       register-unary-assignment          (regname <- unop liroperand)                          "~(~A~) <- ~A ~(~A~)")
+(define-lir-inst :regval      register-value-assignment          (regname <- liroperand)                               "~(~A~) <- ~(~A~)")
+(define-lir-inst :regcond     conditional-register-assignment    (regname1 <- regname2 liroperand)                     "~(~A~) <- (~(~A~)) ~(~A~)")
+;; BOOK: fig. 4.11 says regcond has no left -- table 4.9 says it does.
+(define-lir-inst :regelt      register-bitfield-assignment       (regname integer1 integer2 <- liroperand)             "~(~A~)[~A:~A] <- ~(~A~)")
+;; BOOK: fig. 4.11 says regelt has no left -- table 4.9 says it does.
+(define-lir-inst :stormem     memory-store                       (memaddr <- liroperand)                               "~A <- ~(~A~)")
+;; XXX: memaddr on the left -> not a real left
+(define-lir-inst :loadmem     memory-load                        (regname <- memaddr)                                  "~(~A~) <- ~A")
+;; goto skipped
+(define-lir-inst :gotoaddr    computed-goto                      (regname integer)                                     "goto ~(~A~) + #x~X")
+(define-lir-inst :regbinif    register-binary-condition          (liroperand1 binop liroperand2 label)                 "if ~(~A~) ~A ~(~A~) goto ~(~A~)")
+(define-lir-inst :regunif     register-unary-condition           (unop liroperand label)                               "if ~A ~(~A~) goto ~(~A~)")
+(define-lir-inst :regvalif    register-value-condition           (liroperand label)                                    "if ~(~A~) goto ~(~A~)")
+(define-mir-inst :bintrap     register-binary-trap               (liroperand1 binop liroperand2 trapno)                "if ~(~A~) ~A ~(~A~) trap #x~X")
+(define-mir-inst :untrap      register-unary-trap                (unop liroperand trapno)                              "if ~A ~(~A~) trap #x~X")
+(define-mir-inst :valtrap     register-value-trap                (liroperand trapno)                                   "if ~(~A~) trap #x~X")
+(define-lir-inst :callreg     constant-call                      (procname regname)                                    "call ~(~A~) ~(~A~)")
+(define-lir-inst :callreg2    register-call                      (regname1 regname2)                                   "call ~(~A~) ~(~A~)")
+(define-lir-inst :callregasgn constant-call-assignment           (regname1 <- procname regname2)                       "~(~A~) <- call ~(~A~) ~(~A~)")
+(define-lir-inst :callreg3    register-call-assignment           (regname1 <- regname2 regname3)                       "~(~A~) <- call ~(~A~) ~(~A~)")
+(define-lir-inst :lirretval   lir-return-value                   (liroperand)                                          "return ~(~A~)")
+(define-lir-inst :regno       register-reference                 (regname)                                             "~(~A~)")
+;; typename omitted
+;; BOOK: LIR typename vs. MIR TNi
+
+(define-lir-memaddr-inst :addr1r register-memory-reference          (regname length)                                   "[~(~A~)](~A)")
+(define-lir-memaddr-inst :addr2r register-register-memory-reference (regname1 regname2 length)                         "[~(~A~)+~(~A~)](~A)")
+(define-lir-memaddr-inst :addrrc register-constant-memory-reference (regname integer length)                           "[~(~A~)+~(~A~)](~A)")
+
+;;;;
+;;;; Function
+;;;;
+(defclass basic-block ()
+  ((pred :accessor bb-pred :initform nil)
+   (succ :accessor bb-succ :initform nil)
+   (insts :accessor bb-insts :initform (make-array 0 :element-type 'inst :adjustable t))))
+
+(defclass procedure ()
+  ((name :reader proc-name :initarg :name)
+   (blocks :accessor proc-blocks :initarg :blocks :initform (make-array 0 :element-type 'basic-block :adjustable t))
+   (lblocks :accessor proc-lblocks :initarg :lblocks :initform (make-array 0 :element-type 'basic-block :adjustable t))))
+
+(defgeneric insert-before (block inst i)
+  (:method ((o basic-block) (inst inst) i)
+    (with-slots (insts) o
+      (setf insts (adjust-array insts (1+ (length insts)) :element-type inst)
+            (subseq insts (1+ i)) (subseq insts i (1- (length insts)))
+            (aref insts i) inst))))
+(defgeneric insert-after (block inst i)
+  (:method ((o basic-block) (inst inst) i &aux
+            (oldary (bb-insts o)))
+    (with-slots (insts) o
+      (setf insts (adjust-array insts (1+ (length insts)) :element-type inst))
+      (let ((lastidx (- (length insts) 2)))
+        (cond ((and (= i lastidx)
+                    (control-transfer-p (aref oldary lastidx)))
+               (setf (aref newary lastidx) inst
+                     (aref newary (1+ lastidx)) (aref oldary lastidx)))
+              (t
+               (setf (aref newary (1+ i)) inst
+                     (subseq newary (1+ i)) (subseq oldary i))))
+        (setf (bb-insts o) newary)))))
+(defgeneric append-block (block inst)
+  (:method ((o basic-block) (inst inst))
+    (insert-after o inst (1- (length (bb-insts o))))))
 
 ;;;
 ;;; IR1
@@ -116,7 +406,7 @@
    (df-code :accessor expr-df-code :initform nil :documentation "DF nodes in CODE order (to facilitate side-effect ordering preservation).")))
 
 (define-print-object-method ((o expr) effect-free pure value-used type code)
-    "~@<#<EXPR ~;effect-free: ~S, pure: ~S, used: ~S, type: ~S~_~{~S~:@_~}~;>~:@>" effect-free pure value-used type code)
+    "~@<#<EXPR ~;effect-free: ~S, pure: ~S, used: ~S, type: ~S~_~{~S~:@_~}~;>~:@>" effect-free pure value-used type code) ;
 
 (defclass tn (expr)
   ()

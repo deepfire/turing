@@ -3,7 +3,7 @@
 (defpackage #:turing
   (:use :common-lisp :alexandria :iterate :pergamum :environment :isa)
   (:shadowing-import-from :isa #:disassemble)
-  (:shadow #:frame)
+  (:shadow #:frame #:make-symbol #:symbol #:variable)
   (:export
    ))
 
