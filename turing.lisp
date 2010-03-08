@@ -259,21 +259,21 @@
 (define-lir-inst :stormem     memory-store                       (memaddr <- liroperand)                               "~A <- ~(~A~)")
 ;; XXX: memaddr on the left -> not a real left
 (define-lir-inst :loadmem     memory-load                        (regname <- memaddr)                                  "~(~A~) <- ~A")
-;; goto skipped
+(define-lir-inst :lirgoto     lir-goto                           (label)                                               "goto ~(~A~)")
 (define-lir-inst :gotoaddr    computed-goto                      (regname integer)                                     "goto ~(~A~) + #x~X")
 (define-lir-inst :regbinif    register-binary-condition          (liroperand1 binop liroperand2 label)                 "if ~(~A~) ~A ~(~A~) goto ~(~A~)")
 (define-lir-inst :regunif     register-unary-condition           (unop liroperand label)                               "if ~A ~(~A~) goto ~(~A~)")
 (define-lir-inst :regvalif    register-value-condition           (liroperand label)                                    "if ~(~A~) goto ~(~A~)")
-(define-mir-inst :bintrap     register-binary-trap               (liroperand1 binop liroperand2 trapno)                "if ~(~A~) ~A ~(~A~) trap #x~X")
-(define-mir-inst :untrap      register-unary-trap                (unop liroperand trapno)                              "if ~A ~(~A~) trap #x~X")
-(define-mir-inst :valtrap     register-value-trap                (liroperand trapno)                                   "if ~(~A~) trap #x~X")
+(define-lir-inst :bintrap     register-binary-trap               (liroperand1 binop liroperand2 trapno)                "if ~(~A~) ~A ~(~A~) trap #x~X")
+(define-lir-inst :untrap      register-unary-trap                (unop liroperand trapno)                              "if ~A ~(~A~) trap #x~X")
+(define-lir-inst :valtrap     register-value-trap                (liroperand trapno)                                   "if ~(~A~) trap #x~X")
 (define-lir-inst :callreg     constant-call                      (procname regname)                                    "call ~(~A~) ~(~A~)")
 (define-lir-inst :callreg2    register-call                      (regname1 regname2)                                   "call ~(~A~) ~(~A~)")
 (define-lir-inst :callregasgn constant-call-assignment           (regname1 <- procname regname2)                       "~(~A~) <- call ~(~A~) ~(~A~)")
 (define-lir-inst :callreg3    register-call-assignment           (regname1 <- regname2 regname3)                       "~(~A~) <- call ~(~A~) ~(~A~)")
 (define-lir-inst :lirretval   lir-return-value                   (liroperand)                                          "return ~(~A~)")
 (define-lir-inst :regno       register-reference                 (regname)                                             "~(~A~)")
-;; typename omitted
+(define-lir-inst :lirtn       lir-type-name                      (typename)                                            "~(~A~)")
 ;; BOOK: LIR typename vs. MIR TNi
 
 (define-lir-memaddr-inst :addr1r register-memory-reference          (regname length)                                   "[~(~A~)](~A)")
