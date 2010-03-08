@@ -300,19 +300,18 @@
             (subseq insts (1+ i)) (subseq insts i (1- (length insts)))
             (aref insts i) inst))))
 (defgeneric insert-after (block inst i)
-  (:method ((o basic-block) (inst inst) i &aux
-            (oldary (bb-insts o)))
+  (:method ((o basic-block) (inst inst) i)
     (with-slots (insts) o
       (setf insts (adjust-array insts (1+ (length insts)) :element-type inst))
       (let ((lastidx (- (length insts) 2)))
         (cond ((and (= i lastidx)
-                    (control-transfer-p (aref oldary lastidx)))
-               (setf (aref newary lastidx) inst
-                     (aref newary (1+ lastidx)) (aref oldary lastidx)))
+                    (control-transfer-p (aref insts lastidx)))
+               (setf (aref insts (1+ lastidx)) (aref insts lastidx)
+                     (aref insts lastidx) inst))
               (t
-               (setf (aref newary (1+ i)) inst
-                     (subseq newary (1+ i)) (subseq oldary i))))
-        (setf (bb-insts o) newary)))))
+               (setf 
+                     (subseq insts (+ 2 i)) (subseq insts (1+ i) (1- (length insts)))
+                     (aref insts (1+ i)) inst)))))))
 (defgeneric append-block (block inst)
   (:method ((o basic-block) (inst inst))
     (insert-after o inst (1- (length (bb-insts o))))))
