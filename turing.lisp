@@ -94,19 +94,27 @@
                      :iterator do-symtab-entries)
 
 (defun make-symtab (&optional parent)
+  "Creates a new local symbol table with the given symtol table as its parent,
+or NIL if there is none, and returns the new (empty) local symbol table."
   (%make-symtab parent))
 
 (defun dest-symtab (x)
+  "Destroys the current local symbol table and returns its parent (or nil
+if there is no parent)."
   (when-let ((parent (symtable-parent x)))
     (removef x (symtable-childs parent))
     parent))
 
 (defun insert-sym (symtab x)
+  "Inserts an entry for the given symbol into the given symbol table and returns T,
+or if the symbol is already present, does not insert a new netry and returns NIL."
   (unless (locate-sym symtab x)
     (setf (locate-sym symtab x) (make-symentry :name x))
     t))
 
 (defun enclosing-symtab (symtab x)
+  "Returns the nearest enclosing symbol table that declares X,
+or NIL if there is none."
   (labels ((rec (symtab)
              (or (when (locate-sym symtab x)
                    symtab)
@@ -115,6 +123,8 @@
     (rec symtab)))
 
 (defun depth-of-symtab (symtab)
+  "Returns the depth of the given symbol table relative to the current one,
+which, by convention, has depth zero."
   (labels ((rec (depth symtab)
              (if-let ((parent (symtab-parent symtab)))
                (rec (1+ depth) parent)
