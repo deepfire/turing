@@ -28,6 +28,184 @@
   (define-simple-error comp-error))
 
 ;;;;
+;;;; Types
+;;;;
+(deftype atomic-ctype () '(member integer char))
+(defstruct (compound-ctype (:conc-name ctype-))
+  (constructor)
+  (arity))
+(defstruct (array-ctype (:include compound-ctype) (:conc-name ctype-))
+  (base-type)
+  (dimensions))
+(defstruct (record-ctype (:include compound-ctype) (:conc-name ctype-))
+  (fields))
+(deftype ctype () '(or compound-ctype atomic-ctype))
+
+(defclass ctype-env ()
+  ((ctypes :initform (make-hash-table :test 'eq))))
+
+(define-subcontainer ctype :container-slot ctypes)
+
+;;;;
+;;;; Architecture bits
+;;;;
+(defclass load-store-architecture ()
+  ((loads :reader arch-loads :initarg :loads)
+   (stores :reader arch-stores :initarg :stores)))
+
+(defgeneric emit-load (arch to-reg base-reg displacement))
+(defgeneric emit-store (arch from-reg base-reg displacement))
+
+;;;;
+;;;; Symbol table
+;;;;
+
+(defstruct symentry
+  (name)
+  (class nil :type (member :local :local-static))
+  (size)
+  (bitsize)
+  (boundary)
+  (bitboundary)
+  (type nil :type (member :s8 :u8 :s16 :u18 :s32 :u32 :s64 :u64 :float :double-float :quad-float))
+  (basetype)
+  (nelts)
+  (machtype)
+  (props (make-hash-table :test 'equal)))
+
+(defvar *direct-properties* '(name class size bitsize boundary bitboundary type basetype nelts machtype))
+
+(define-subcontainer symprop :type t :container-slot props :if-does-not-exist :continue)
+
+(defmacro with-symentry-properties (properties entry &body body)
+  (multiple-value-bind (direct indirect) (unzip (rcurry #'member *direct-properties*) properties)
+    (once-only (entry)
+      `(symbol-macrolet ,(iter (for s in indirect)
+                               (collect `(,indirect `(symprop ,,entry ,,indirect))))
+         (with-slots ,direct ,entry
+           ,@body)))))
+
+(defstruct (symtab (:constructor %make-symtab (parent)))
+  (parent nil :type (or null symtable))
+  (syms (make-hash-table :test 'equal) :type hash-table)
+  (childs nil :type list))
+
+(define-subcontainer locate-sym :container-slot syms :key-type string :type symentry :if-exists :continue :if-does-not-exist :continue
+                     :iterator do-symtab-entries)
+
+(defun make-symtab (&optional parent)
+  (%make-symtab parent))
+
+(defun dest-symtab (x)
+  (when-let ((parent (symtable-parent x)))
+    (removef x (symtable-childs parent))
+    parent))
+
+(defun insert-sym (symtab x)
+  (unless (locate-sym symtab x)
+    (setf (locate-sym symtab x) (make-symentry :name x))
+    t))
+
+(defun enclosing-symtab (symtab x)
+  (labels ((rec (symtab)
+             (or (locate-sym symtab x)
+                 (when-let ((parent (symtab-parent symtab)))
+                   (rec parent)))))
+    (rec symtab)))
+
+(defun depth-of-symtab (symtab)
+  (labels ((rec (depth symtab)
+             (if-let ((parent (symtab-parent symtab)))
+               (rec (1+ depth) parent)
+               depth)))
+    (rec 0 symtab)))
+
+;;;;
+;;;; Storage binding
+;;;;
+(defun round-abs-up (m n)
+  "Ensure that M is aligned by N."
+  (* (signum m) (ceiling (abs (coerce (/ m n) 'float))) (abs n)))
+
+(defun bind-local-vars (symtab initdisp)
+  "Assign each static variable a displacement and, for stack-allocated variables,
+assigns a displacement and the frame pointer as the base register."
+  (let ((stackloc initdisp)
+        (staticloc 0)
+        ;; Sort frame entries in order of decreasing alignment requirements.
+        ;; When we overflow load/store displacement constants, this becomes
+        ;; a size vs. speed tradeoff -- reverting this order, while maintaining
+        ;; alignment requirements allows us to access more frame locals, with
+        ;; a negligible size loss.
+        ;; XXX: we should default to that, actually.
+        (alignment-sorted-entries (sort (do-symtab-entries (s symtab) (collect s))
+                                        #'> :key #'symentry-size)))
+    (dolist (entry alignment-sorted-entries)
+      (with-slots (class size basetype nelts) entry
+        (ecase class
+          (:local
+           (case basetype
+             (:record
+              (dotimes (i nelts)
+                (let ((field-size (symprop entry `(,i size))))
+                  (decf stackloc field-size)
+                  (setf stackloc (round-abs-up stackloc field-size)
+                        (symprop entry 'reg) "fp"
+                        (symprop entry `(,i disp)) stackloc))))
+             (t
+              (decf stackloc size)
+              (setf stackloc (round-abs-up stackloc size)
+                    (symprop entry 'reg) "fp"
+                    (symprop entry 'disp) stackloc))))
+          (:local-static
+           (case basetype
+             (:record
+              (dotimes (i nelts)
+                (let ((field-size (symprop entry `(,i size))))
+                  (setf staticloc (round-abs-up staticloc field-size)
+                        (symprop entry `(,i disp)) staticloc)
+                  (incf staticloc field-size))))
+             (t
+              (setf staticloc (round-abs-up staticloc size)
+                    (symprop entry 'disp) staticloc)
+              (incf staticloc size)))))))))
+
+;;;;
+;;;; Variable load/store
+;;;;
+(defun sym-to-reg (symtab var)
+  "Generates a load from storage location corresponding to a given variable
+to a register, register pair, or register quadruple of the appopriate
+type, and returns the name of the first register.")
+
+(defun sym-to-reg-force (symtab var register)
+  "Generates a load from storage location corresponding to a given symbol
+to the named register, register pair, or register quadruple of the appopriate
+type.  This routine can be used, for example, to force procedure arguments to
+the appropriate registers.")
+
+(defun alloc-reg (symtab var)
+  "Allocates a register, register pair, or register quadruple of the
+appropriate type to hold the value of its VARiable argument and sets the 'reg'
+field in the variable's symbol-table entry, unless there already is a register
+allocated, and (in either case) returns the name of the first register.")
+
+(defun reg-to-sym (symtab register)
+  "Generates a store of REGISTER name to the variable's storage location.")
+
+(defun alloc-reg-anon (floatp integer)
+  "Allocates a register, register pair, or register quadruple of the
+appropriate type (according to the value of the second argument, which
+may be 1, 2 or 4) and returns the name of the first register.  It does not
+associate the register with a symbol, unlike ALLOC-REG.")
+
+(defun free-reg (register)
+  "Returns its argument register to the pool of available registers.")
+
+(defun find-symtab (symtab variable))
+(defun gen-ldst (symtab opcode reg symdisp storep))
+
+;;;;
 ;;;; Operands
 ;;;;
 (defclass constant () ((value :reader value :initarg :value)))
