@@ -108,7 +108,8 @@
 
 (defun enclosing-symtab (symtab x)
   (labels ((rec (symtab)
-             (or (locate-sym symtab x)
+             (or (when (locate-sym symtab x)
+                   symtab)
                  (when-let ((parent (symtab-parent symtab)))
                    (rec parent)))))
     (rec symtab)))
