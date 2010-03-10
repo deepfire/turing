@@ -538,38 +538,35 @@ BOOKTODO: register tracking."
 ;;;;
 ;;;; Function
 ;;;;
-(defclass basic-block ()
-  ((pred :accessor bb-pred :initform nil)
-   (succ :accessor bb-succ :initform nil)
-   (insts :accessor bb-insts :initform (make-array 0 :element-type 'inst :adjustable t))))
+(defstruct (basic-block (:conc-name bb-))
+  (pred nil :type list)
+  (succ nil :type list)
+  (insts (make-array 0 :element-type 'inst :adjustable t)))
 
-(defclass procedure ()
-  ((name :reader proc-name :initarg :name)
-   (blocks :accessor proc-blocks :initarg :blocks :initform (make-array 0 :element-type 'basic-block :adjustable t))
-   (lblocks :accessor proc-lblocks :initarg :lblocks :initform (make-array 0 :element-type 'basic-block :adjustable t))))
+(defstruct (procedure (:conc-name proc-))
+  (name)
+  (blocks (make-array 0 :element-type 'basic-block :adjustable t) :type vector)
+  (lblocks (make-array 0 :element-type 'basic-block :adjustable t) :type vector))
 
-(defgeneric insert-before (block inst i)
-  (:method ((o basic-block) (inst inst) i)
-    (with-slots (insts) o
-      (setf insts (adjust-array insts (1+ (length insts)) :element-type inst)
-            (subseq insts (1+ i)) (subseq insts i (1- (length insts)))
-            (aref insts i) inst))))
-(defgeneric insert-after (block inst i)
-  (:method ((o basic-block) (inst inst) i)
-    (with-slots (insts) o
-      (setf insts (adjust-array insts (1+ (length insts)) :element-type inst))
-      (let ((lastidx (- (length insts) 2)))
-        (cond ((and (= i lastidx)
-                    (control-transfer-p (aref insts lastidx)))
-               (setf (aref insts (1+ lastidx)) (aref insts lastidx)
-                     (aref insts lastidx) inst))
-              (t
-               (setf 
-                     (subseq insts (+ 2 i)) (subseq insts (1+ i) (1- (length insts)))
-                     (aref insts (1+ i)) inst)))))))
-(defgeneric append-block (block inst)
-  (:method ((o basic-block) (inst inst))
-    (insert-after o inst (1- (length (bb-insts o))))))
+(defun insert-before (block inst i)
+  (with-slots (insts) o
+    (setf insts (adjust-array insts (1+ (length insts)) :element-type inst)
+          (subseq insts (1+ i)) (subseq insts i (1- (length insts)))
+          (aref insts i) inst)))
+(defun insert-after (block inst i)
+  (with-slots (insts) o
+    (setf insts (adjust-array insts (1+ (length insts)) :element-type inst))
+    (let ((lastidx (- (length insts) 2)))
+      (cond ((and (= i lastidx)
+                  (control-transfer-p (aref insts lastidx)))
+             (setf (aref insts (1+ lastidx)) (aref insts lastidx)
+                   (aref insts lastidx) inst))
+            (t
+             (setf 
+              (subseq insts (+ 2 i)) (subseq insts (1+ i) (1- (length insts)))
+              (aref insts (1+ i)) inst))))))
+(defun append-block (block inst)
+  (insert-after o inst (1- (length (bb-insts o)))))
 
 ;;;
 ;;; IR1
