@@ -81,7 +81,8 @@
   (machtype)
   (props (make-hash-table :test 'equal)))
 
-(defvar *direct-properties* '(name class size bitsize boundary bitboundary type basetype nelts machtype))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *direct-properties* '(name class size bitsize boundary bitboundary type basetype nelts machtype)))
 
 (define-subcontainer symprop :type t :container-slot props :if-does-not-exist :continue)
 
@@ -94,7 +95,7 @@
            ,@body)))))
 
 (defstruct (symtab (:constructor %make-symtab (parent)))
-  (parent nil :type (or null symtable))
+  (parent nil :type (or null symtab))
   (syms (make-hash-table :test 'equal) :type hash-table)
   (childs nil :type list))
 
@@ -109,8 +110,8 @@ or NIL if there is none, and returns the new (empty) local symbol table."
 (defun dest-symtab (x)
   "Destroys the current local symbol table and returns its parent (or nil
 if there is no parent)."
-  (when-let ((parent (symtable-parent x)))
-    (removef x (symtable-childs parent))
+  (when-let ((parent (symtab-parent x)))
+    (removef x (symtab-childs parent))
     parent))
 
 (defun insert-sym (symtab x)
@@ -519,9 +520,9 @@ BOOKTODO: register tracking."
 (define-lir-inst :regbinif    register-binary-condition          (liroperand1 binop liroperand2 label)                 "if ~(~A~) ~A ~(~A~) goto ~(~A~)")
 (define-lir-inst :regunif     register-unary-condition           (unop liroperand label)                               "if ~A ~(~A~) goto ~(~A~)")
 (define-lir-inst :regvalif    register-value-condition           (liroperand label)                                    "if ~(~A~) goto ~(~A~)")
-(define-lir-inst :bintrap     register-binary-trap               (liroperand1 binop liroperand2 trapno)                "if ~(~A~) ~A ~(~A~) trap #x~X")
-(define-lir-inst :untrap      register-unary-trap                (unop liroperand trapno)                              "if ~A ~(~A~) trap #x~X")
-(define-lir-inst :valtrap     register-value-trap                (liroperand trapno)                                   "if ~(~A~) trap #x~X")
+(define-lir-inst :lir-bintrap lir-register-binary-trap           (liroperand1 binop liroperand2 trapno)                "if ~(~A~) ~A ~(~A~) trap #x~X")
+(define-lir-inst :lir-untrap  lir-register-unary-trap            (unop liroperand trapno)                              "if ~A ~(~A~) trap #x~X")
+(define-lir-inst :lir-valtrap lir-register-value-trap            (liroperand trapno)                                   "if ~(~A~) trap #x~X")
 (define-lir-inst :callreg     constant-call                      (procname regname)                                    "call ~(~A~) ~(~A~)")
 (define-lir-inst :callreg2    register-call                      (regname1 regname2)                                   "call ~(~A~) ~(~A~)")
 (define-lir-inst :callregasgn constant-call-assignment           (regname1 <- procname regname2)                       "~(~A~) <- call ~(~A~) ~(~A~)")
@@ -549,12 +550,12 @@ BOOKTODO: register tracking."
   (lblocks (make-array 0 :element-type 'basic-block :adjustable t) :type vector))
 
 (defun insert-before (block inst i)
-  (with-slots (insts) o
+  (with-slots (insts) block
     (setf insts (adjust-array insts (1+ (length insts)) :element-type inst)
           (subseq insts (1+ i)) (subseq insts i (1- (length insts)))
           (aref insts i) inst)))
 (defun insert-after (block inst i)
-  (with-slots (insts) o
+  (with-slots (insts) block
     (setf insts (adjust-array insts (1+ (length insts)) :element-type inst))
     (let ((lastidx (- (length insts) 2)))
       (cond ((and (= i lastidx)
@@ -566,7 +567,7 @@ BOOKTODO: register tracking."
               (subseq insts (+ 2 i)) (subseq insts (1+ i) (1- (length insts)))
               (aref insts (1+ i)) inst))))))
 (defun append-block (block inst)
-  (insert-after o inst (1- (length (bb-insts o)))))
+  (insert-after block inst (1- (length (bb-insts block)))))
 
 ;;;
 ;;; IR1
