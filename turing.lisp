@@ -51,10 +51,18 @@
 ;;;;
 (defclass load-store-architecture ()
   ((loads :reader arch-loads :initarg :loads)
-   (stores :reader arch-stores :initarg :stores)))
+   (stores :reader arch-stores :initarg :stores)
+   (addrtype :reader arch-addrtype :initarg :addrtype)))
 
-(defgeneric emit-load (arch to-reg base-reg displacement))
-(defgeneric emit-store (arch from-reg base-reg displacement))
+(defgeneric emit-register-move (arch to-reg from-reg))
+(defgeneric emit-load (arch type to-reg base-reg displacement))
+(defgeneric emit-store (arch type from-reg base-reg displacement))
+(defgeneric emit-address-load (arch to-reg base-reg displacement)
+  (:method (arch to-reg base-reg displacement)
+    (emit-load arch (arch-addrtype arch) to-reg base-reg displacement)))
+(defgeneric constant-fits-displacement (arch x))
+(defgeneric clamp-constant-to-fit-displacement (arch x))
+(defgeneric emit-extended-displacement-base-register-set (arch register x))
 
 ;;;;
 ;;;; Symbol table
@@ -81,7 +89,7 @@
   (multiple-value-bind (direct indirect) (unzip (rcurry #'member *direct-properties*) properties)
     (once-only (entry)
       `(symbol-macrolet ,(iter (for s in indirect)
-                               (collect `(,indirect `(symprop ,,entry ,,indirect))))
+                               (collect `(,s `(symprop ,,entry ,',s))))
          (with-slots ,direct ,entry
            ,@body)))))
 
@@ -182,39 +190,97 @@ assigns a displacement and the frame pointer as the base register."
               (incf staticloc size)))))))))
 
 ;;;;
+;;;; Context
+;;;;
+(defclass ccontext ()
+  ((arch :reader cctx-arch :initarg :arch)
+   (global-symtab :reader cctx-global-symtab :initarg :global-symtab)
+   (depth :accessor cctx-depth :initarg :depth)
+   (static-link-offset :accessor cctx-static-link-offset :initarg :static-link-offset))
+  (:default-initargs
+   :global-symtab (make-symtab)))
+
+;;;;
 ;;;; Variable load/store
 ;;;;
-(defun sym-to-reg (symtab var)
-  "Generates a load from storage location corresponding to a given variable
-to a register, register pair, or register quadruple of the appopriate
-type, and returns the name of the first register.")
-
-(defun sym-to-reg-force (symtab var register)
-  "Generates a load from storage location corresponding to a given symbol
-to the named register, register pair, or register quadruple of the appopriate
-type.  This routine can be used, for example, to force procedure arguments to
-the appropriate registers.")
-
-(defun alloc-reg (symtab var)
+(defun alloc-reg (cctx symtab var)
   "Allocates a register, register pair, or register quadruple of the
 appropriate type to hold the value of its VARiable argument and sets the 'reg'
 field in the variable's symbol-table entry, unless there already is a register
 allocated, and (in either case) returns the name of the first register.")
 
-(defun reg-to-sym (symtab register)
-  "Generates a store of REGISTER name to the variable's storage location.")
-
-(defun alloc-reg-anon (floatp integer)
+(defun alloc-reg-anon (cctx floatp integer)
   "Allocates a register, register pair, or register quadruple of the
 appropriate type (according to the value of the second argument, which
 may be 1, 2 or 4) and returns the name of the first register.  It does not
 associate the register with a symbol, unlike ALLOC-REG.")
 
-(defun free-reg (register)
+(defun free-reg (cctx register)
   "Returns its argument register to the pool of available registers.")
 
-(defun find-symtab (symtab variable))
-(defun gen-ldst (symtab opcode reg symdisp storep))
+(defun find-symtab (cctx symtab variable)
+  (setf (cctx-depth cctx) 0)
+  (or (find-if (rcurry #'locate-sym variable) 
+               (list symtab (cctx-global-symtab cctx)))
+      (lret ((parent-symtab (enclosing-symtab symtab variable)))
+        (setf (cctx-depth cctx) (depth-of-symtab parent-symtab)))))
+
+(defun gen-ldst (cctx symtab type reg symdisp storep &aux
+                 (globalp (eq symtab (cctx-global-symtab cctx))))
+  (let ((base-reg (if globalp "gp" "fp")))
+    (unless globalp
+      ;; As symdisp is relative to the procedure-global fp, we need to obtain it.
+      (let ((scratch-reg (if storep
+                             (alloc-reg-anon cctx nil 4) ; can't reuse source reg as scratch
+                             reg)))
+        (dotimes (i (cctx-depth cctx))
+          (emit-address-load (cctx-arch cctx) scratch-reg base-reg (cctx-static-link-offset cctx))
+          (emit-register-move (cctx-arch cctx) base-reg scratch-reg)
+          ;; XXXBOOK: wtf was supposed to be this line?  Page 63.
+          ;; (setf base-reg scratch-reg)
+          )
+        (when storep
+          (free-reg cctx scratch-reg))))
+    (cond ((constant-fits-displacement (cctx-arch cctx) symdisp)
+           (if storep
+               (emit-store (cctx-arch cctx) type reg base-reg symdisp)
+               (emit-load  (cctx-arch cctx) type reg base-reg symdisp)))
+          (t
+           (emit-extended-displacement-base-register-set (cctx-arch cctx) base-reg symdisp)
+           (let ((clamped-displacement (clamp-constant-to-fit-displacement (cctx-arch cctx) symdisp)))
+             (if storep
+                 (emit-store (cctx-arch cctx) type reg base-reg clamped-displacement)
+                 (emit-load  (cctx-arch cctx) type reg base-reg clamped-displacement)))))))
+
+(defun sym-to-reg (cctx symtab var)
+  "Generates a load from storage location corresponding to a given variable
+to a register, register pair, or register quadruple of the appopriate
+type, and returns the name of the first register.
+BOOKTODO: register tracking."
+  (let ((parent-symtab (find-symtab cctx symtab var)))
+    (with-symentry-properties (inregp register type disp) (locate-sym parent-symtab var)
+      (if inregp
+          register
+          (lret ((symreg (alloc-reg cctx symtab var)))
+            (gen-ldst cctx symtab type register disp nil))))))
+
+(defun sym-to-reg-force (cctx symtab var register)
+  "Generates a load from storage location corresponding to a given symbol
+to the named register, register pair, or register quadruple of the appopriate
+type.  This routine can be used, for example, to force procedure arguments to
+the appropriate registers.
+BOOKTODO: register tracking."
+  (let ((parent-symtab (find-symtab cctx symtab var)))
+    (with-symentry-properties (type disp) (locate-sym parent-symtab var)
+      (gen-ldst cctx symtab type register disp nil))))
+
+;;; XXXBOOK: declares reg-to-sym as Symtab x Register -> Var
+(defun reg-to-sym (cctx symtab register var)
+  "Generates a store of REGISTER name to the variable's storage location.
+BOOKTODO: register tracking."
+  (let ((parent-symtab (find-symtab cctx symtab var)))
+    (with-symentry-properties (type disp) (locate-sym parent-symtab var)
+      (gen-ldst cctx symtab type register disp t))))
 
 ;;;;
 ;;;; Operands
