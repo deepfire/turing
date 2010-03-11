@@ -47,27 +47,8 @@
 (define-subcontainer ctype :container-slot ctypes)
 
 ;;;;
-;;;; Architecture bits
-;;;;
-(defclass load-store-architecture ()
-  ((loads :reader arch-loads :initarg :loads)
-   (stores :reader arch-stores :initarg :stores)
-   (addrtype :reader arch-addrtype :initarg :addrtype)))
-
-(defgeneric emit-register-move (arch to-reg from-reg))
-(defgeneric emit-load (arch type to-reg base-reg displacement))
-(defgeneric emit-store (arch type from-reg base-reg displacement))
-(defgeneric emit-address-load (arch to-reg base-reg displacement)
-  (:method (arch to-reg base-reg displacement)
-    (emit-load arch (arch-addrtype arch) to-reg base-reg displacement)))
-(defgeneric constant-fits-displacement (arch x))
-(defgeneric clamp-constant-to-fit-displacement (arch x))
-(defgeneric emit-extended-displacement-base-register-set (arch register x))
-
-;;;;
 ;;;; Symbol table
 ;;;;
-
 (defstruct symentry
   (name)
   (class nil :type (member :local :local-static))
@@ -147,11 +128,10 @@ which, by convention, has depth zero."
   "Ensure that M is aligned by N."
   (* (signum m) (ceiling (abs (coerce (/ m n) 'float))) (abs n)))
 
-(defun bind-local-vars (symtab initdisp)
+(defun bind-local-vars (cctx symtab initdisp)
   "Assign each static variable a displacement and, for stack-allocated variables,
 assigns a displacement and the frame pointer as the base register."
   (let ((stackloc initdisp)
-        (staticloc 0)
         ;; Sort frame entries in order of decreasing alignment requirements.
         ;; When we overflow load/store displacement constants, this becomes
         ;; a size vs. speed tradeoff -- reverting this order, while maintaining
@@ -178,110 +158,18 @@ assigns a displacement and the frame pointer as the base register."
                     (symprop entry 'reg) "fp"
                     (symprop entry 'disp) stackloc))))
           (:local-static
-           (case basetype
-             (:record
-              (dotimes (i nelts)
-                (let ((field-size (symprop entry `(,i size))))
-                  (setf staticloc (round-abs-up staticloc field-size)
-                        (symprop entry `(,i disp)) staticloc)
-                  (incf staticloc field-size))))
-             (t
-              (setf staticloc (round-abs-up staticloc size)
-                    (symprop entry 'disp) staticloc)
-              (incf staticloc size)))))))))
-
-;;;;
-;;;; Context
-;;;;
-(defclass ccontext ()
-  ((arch :reader cctx-arch :initarg :arch)
-   (global-symtab :reader cctx-global-symtab :initarg :global-symtab)
-   (depth :accessor cctx-depth :initarg :depth)
-   (static-link-offset :accessor cctx-static-link-offset :initarg :static-link-offset))
-  (:default-initargs
-   :global-symtab (make-symtab)))
-
-;;;;
-;;;; Variable load/store
-;;;;
-(defun alloc-reg (cctx symtab var)
-  "Allocates a register, register pair, or register quadruple of the
-appropriate type to hold the value of its VARiable argument and sets the 'reg'
-field in the variable's symbol-table entry, unless there already is a register
-allocated, and (in either case) returns the name of the first register.")
-
-(defun alloc-reg-anon (cctx floatp integer)
-  "Allocates a register, register pair, or register quadruple of the
-appropriate type (according to the value of the second argument, which
-may be 1, 2 or 4) and returns the name of the first register.  It does not
-associate the register with a symbol, unlike ALLOC-REG.")
-
-(defun free-reg (cctx register)
-  "Returns its argument register to the pool of available registers.")
-
-(defun find-symtab (cctx symtab variable)
-  (setf (cctx-depth cctx) 0)
-  (or (find-if (rcurry #'locate-sym variable) 
-               (list symtab (cctx-global-symtab cctx)))
-      (lret ((parent-symtab (enclosing-symtab symtab variable)))
-        (setf (cctx-depth cctx) (depth-of-symtab parent-symtab)))))
-
-(defun gen-ldst (cctx symtab type reg symdisp storep &aux
-                 (globalp (eq symtab (cctx-global-symtab cctx))))
-  (let ((base-reg (if globalp "gp" "fp")))
-    (unless globalp
-      ;; As symdisp is relative to the procedure-global fp, we need to obtain it.
-      (let ((scratch-reg (if storep
-                             (alloc-reg-anon cctx nil 4) ; can't reuse source reg as scratch
-                             reg)))
-        (dotimes (i (cctx-depth cctx))
-          (emit-address-load (cctx-arch cctx) scratch-reg base-reg (cctx-static-link-offset cctx))
-          (emit-register-move (cctx-arch cctx) base-reg scratch-reg)
-          ;; XXXBOOK: wtf was supposed to be this line?  Page 63.
-          ;; (setf base-reg scratch-reg)
-          )
-        (when storep
-          (free-reg cctx scratch-reg))))
-    (cond ((constant-fits-displacement (cctx-arch cctx) symdisp)
-           (if storep
-               (emit-store (cctx-arch cctx) type reg base-reg symdisp)
-               (emit-load  (cctx-arch cctx) type reg base-reg symdisp)))
-          (t
-           (emit-extended-displacement-base-register-set (cctx-arch cctx) base-reg symdisp)
-           (let ((clamped-displacement (clamp-constant-to-fit-displacement (cctx-arch cctx) symdisp)))
-             (if storep
-                 (emit-store (cctx-arch cctx) type reg base-reg clamped-displacement)
-                 (emit-load  (cctx-arch cctx) type reg base-reg clamped-displacement)))))))
-
-(defun sym-to-reg (cctx symtab var)
-  "Generates a load from storage location corresponding to a given variable
-to a register, register pair, or register quadruple of the appopriate
-type, and returns the name of the first register.
-BOOKTODO: register tracking."
-  (let ((parent-symtab (find-symtab cctx symtab var)))
-    (with-symentry-properties (inregp register type disp) (locate-sym parent-symtab var)
-      (if inregp
-          register
-          (lret ((symreg (alloc-reg cctx symtab var)))
-            (gen-ldst cctx symtab type register disp nil))))))
-
-(defun sym-to-reg-force (cctx symtab var register)
-  "Generates a load from storage location corresponding to a given symbol
-to the named register, register pair, or register quadruple of the appopriate
-type.  This routine can be used, for example, to force procedure arguments to
-the appropriate registers.
-BOOKTODO: register tracking."
-  (let ((parent-symtab (find-symtab cctx symtab var)))
-    (with-symentry-properties (type disp) (locate-sym parent-symtab var)
-      (gen-ldst cctx symtab type register disp nil))))
-
-;;; XXXBOOK: declares reg-to-sym as Symtab x Register -> Var
-(defun reg-to-sym (cctx symtab register var)
-  "Generates a store of REGISTER name to the variable's storage location.
-BOOKTODO: register tracking."
-  (let ((parent-symtab (find-symtab cctx symtab var)))
-    (with-symentry-properties (type disp) (locate-sym parent-symtab var)
-      (gen-ldst cctx symtab type register disp t))))
+           (with-slots (static-link-offset) cctx
+             (case basetype
+               (:record
+                (dotimes (i nelts)
+                  (let ((field-size (symprop entry `(,i size))))
+                    (setf static-link-offset (round-abs-up static-link-offset field-size)
+                          (symprop entry `(,i disp)) static-link-offset)
+                    (incf static-link-offset field-size))))
+               (t
+                (setf static-link-offset (round-abs-up static-link-offset size)
+                      (symprop entry 'disp) static-link-offset)
+                (incf static-link-offset size))))))))))
 
 ;;;;
 ;;;; Operands
@@ -537,7 +425,7 @@ BOOKTODO: register tracking."
 (define-lir-memaddr-inst :addrrc register-constant-memory-reference (regname integer length)                           "[~(~A~)+~(~A~)](~A)")
 
 ;;;;
-;;;; Function
+;;;; Code, context
 ;;;;
 (defstruct (basic-block (:conc-name bb-))
   (pred nil :type list)
@@ -546,15 +434,49 @@ BOOKTODO: register tracking."
 
 (defstruct (procedure (:conc-name proc-))
   (name)
+  (static-link-offset)
+  (gsymtab (make-symtab))
+  (depth)
   (blocks (make-array 0 :element-type 'basic-block :adjustable t) :type vector)
   (lblocks (make-array 0 :element-type 'basic-block :adjustable t) :type vector))
 
+(defclass load-store-architecture ()
+  ((loads :reader arch-loads :initarg :loads)
+   (stores :reader arch-stores :initarg :stores)
+   (addrtype :reader arch-addrtype :initarg :addrtype)))
+
+(defgeneric emit-register-move (arch to-reg from-reg))
+(defgeneric emit-load (arch type to-reg base-reg displacement))
+(defgeneric emit-store (arch type from-reg base-reg displacement))
+(defgeneric emit-address-load (arch to-reg base-reg displacement)
+  (:method (arch to-reg base-reg displacement)
+    (emit-load arch (arch-addrtype arch) to-reg base-reg displacement)))
+(defgeneric constant-fits-displacement (arch x))
+(defgeneric clamp-constant-to-fit-displacement (arch x))
+(defgeneric emit-extended-displacement-base-register-set (arch register x))
+
+(defclass ccontext (load-store-architecture)
+  ((staticloc :accessor cctx-staticloc :initarg :staticloc)
+   (procs :reader cctx-procs :initarg :procs))
+  (:default-initargs
+   :staticloc 0 :procs (make-hash-table :test 'eq)))
+
+(define-subcontainer proc :type procedure :iterator do-procs :container-slot procs)
+
+;;;;
+;;;; Basic block machinery
+;;;;
 (defun insert-before (block inst i)
+  "Insert INST before I'th instruction within BLOCK."
   (with-slots (insts) block
     (setf insts (adjust-array insts (1+ (length insts)) :element-type inst)
           (subseq insts (1+ i)) (subseq insts i (1- (length insts)))
           (aref insts i) inst)))
+
 (defun insert-after (block inst i)
+  "Insert INST after I'th instruction within BLOCK.
+When I refers to the last instruction within BLOCK, and that instruction
+is a control transfer, act as INSERT-BEFORE."
   (with-slots (insts) block
     (setf insts (adjust-array insts (1+ (length insts)) :element-type inst))
     (let ((lastidx (- (length insts) 2)))
@@ -566,8 +488,129 @@ BOOKTODO: register tracking."
              (setf 
               (subseq insts (+ 2 i)) (subseq insts (1+ i) (1- (length insts)))
               (aref insts (1+ i)) inst))))))
-(defun append-block (block inst)
+
+(defun append-to-block (block inst)
+  "Insert INST after the last instruction within BLOCK, unless that last
+instruction is a control transfer, in which case insert INST before it."
   (insert-after block inst (1- (length (bb-insts block)))))
+
+(defun delete-block (proc block)
+  "Remove an empty basic block."
+  (with-slots (blocks) proc
+    (let ((posn (or (position block blocks)
+                    (error "~@<~S doesn't belong to ~S.~:@>" block proc))))
+      (setf (subseq blocks posn (1- (length blocks)))
+            (subseq blocks (1+ posn))))
+    (setf blocks (adjust-array blocks (1- (length blocks)))))
+  (removef (bb-pred block) block)
+  (removef (bb-succ block) block)
+  (dolist (pred (bb-pred block))
+    (setf (bb-succ pred) (union (bb-succ block) (remove block (bb-succ pred)))))
+  (dolist (succ (bb-succ block))
+    (setf (bb-pred succ) (union (bb-pred block) (remove block (bb-pred succ))))))
+
+;;; XXXBOOK: doesn't insert the block into the array
+(defun insert-block (proc pred-block succ-block)
+  "Split an edge by inserting a block with NINSTS instructions between the two given blocks."
+  (with-slots (blocks) proc
+    (let ((i (length blocks))
+          (block (make-basic-block :pred (list pred-block) :succ (list succ-block))))
+      (setf blocks (adjust-array blocks (1+ i))
+            (aref blocks i) block
+            (bb-succ pred-block) (cons block (remove succ-block (bb-succ pred-block)))
+            (bb-pred succ-block) (cons block (remove pred-block (bb-pred succ-block)))))))
+
+(defun delete-inst (proc block i)
+  "Delete an instruction at I'th position from a basic block.
+Will remove empty basic blocks."
+  (with-slots (insts) block
+    (if (zerop (length insts))
+        (delete-block proc block)
+        (setf (subseq insts i (1- (length insts))) (subseq insts (1+ i))))))
+
+(defun alloc-reg (proc symtab var)
+  "Allocates a register, register pair, or register quadruple of the
+appropriate type to hold the value of its VARiable argument and sets the 'reg'
+field in the variable's symbol-table entry, unless there already is a register
+allocated, and (in either case) returns the name of the first register.")
+
+(defun alloc-reg-anon (proc floatp integer)
+  "Allocates a register, register pair, or register quadruple of the
+appropriate type (according to the value of the second argument, which
+may be 1, 2 or 4) and returns the name of the first register.  It does not
+associate the register with a symbol, unlike ALLOC-REG.")
+
+(defun free-reg (proc register)
+  "Returns its argument register to the pool of available registers.")
+
+;;;;
+;;;; Variable load/store
+;;;;
+(defun gen-ldst (cctx proc symtab type reg symdisp storep &aux
+                 (globalp (eq symtab (proc-gsymtab proc))))
+  "TODO: emit LIR, instead of target assembly."
+  (let ((base-reg (if globalp "gp" "fp")))
+    (unless globalp
+      ;; As symdisp is relative to the procedure-global fp, we need to obtain it.
+      (let ((scratch-reg (if storep
+                             (alloc-reg-anon cctx nil 4) ; can't reuse source reg as scratch
+                             reg)))
+        (dotimes (i (cctx-depth cctx))
+          (emit-address-load cctx scratch-reg base-reg (proc-static-link-offset proc))
+          (emit-register-move cctx base-reg scratch-reg)
+          ;; XXXBOOK: wtf was supposed to be this line?  Page 63.
+          ;; (setf base-reg scratch-reg)
+          )
+        (when storep
+          (free-reg cctx scratch-reg))))
+    (cond ((constant-fits-displacement cctx symdisp)
+           (if storep
+               (emit-store cctx type reg base-reg symdisp)
+               (emit-load  cctx type reg base-reg symdisp)))
+          (t
+           (emit-extended-displacement-base-register-set cctx base-reg symdisp)
+           (let ((clamped-displacement (clamp-constant-to-fit-displacement cctx symdisp)))
+             (if storep
+                 (emit-store cctx type reg base-reg clamped-displacement)
+                 (emit-load  cctx type reg base-reg clamped-displacement)))))))
+
+(defun find-symtab (proc symtab variable)
+  (setf (proc-depth proc) 0)
+  ;; XXXBOOK: global symtab trumps local syms?
+  (or (find-if (rcurry #'locate-sym variable) 
+               (list symtab (proc-gsymtab proc)))
+      (lret ((parent-symtab (enclosing-symtab symtab variable)))
+        (setf (proc-depth proc) (depth-of-symtab parent-symtab)))))
+
+(defun sym-to-reg (cctx proc symtab var)
+  "Generates a load from storage location corresponding to a given variable
+to a register, register pair, or register quadruple of the appopriate
+type, and returns the name of the first register.
+BOOKTODO: register tracking."
+  (let ((parent-symtab (find-symtab proc symtab var)))
+    (with-symentry-properties (inregp register type disp) (locate-sym parent-symtab var)
+      (if inregp
+          register
+          (lret ((symreg (alloc-reg cctx symtab var)))
+            (gen-ldst cctx proc symtab type register disp nil))))))
+
+(defun sym-to-reg-force (cctx proc symtab var register)
+  "Generates a load from storage location corresponding to a given symbol
+to the named register, register pair, or register quadruple of the appopriate
+type.  This routine can be used, for example, to force procedure arguments to
+the appropriate registers.
+BOOKTODO: register tracking."
+  (let ((parent-symtab (find-symtab proc symtab var)))
+    (with-symentry-properties (type disp) (locate-sym parent-symtab var)
+      (gen-ldst cctx proc symtab type register disp nil))))
+
+;;; XXXBOOK: declares reg-to-sym as Symtab x Register -> Var
+(defun reg-to-sym (cctx proc symtab register var)
+  "Generates a store of REGISTER name to the variable's storage location.
+BOOKTODO: register tracking."
+  (let ((parent-symtab (find-symtab proc symtab var)))
+    (with-symentry-properties (type disp) (locate-sym parent-symtab var)
+      (gen-ldst proc cctx symtab type register disp t))))
 
 ;;;
 ;;; IR1
