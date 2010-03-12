@@ -28,6 +28,36 @@
   (define-simple-error comp-error))
 
 ;;;;
+;;;; Target-architecture-level
+;;;;
+
+(defclass architecture ()
+  ((loads :reader arch-loads :initarg :loads)
+   (stores :reader arch-stores :initarg :stores)
+   (addrtype :reader arch-addrtype :initarg :addrtype)))
+
+(defgeneric emit-register-move (arch to-reg from-reg))
+(defgeneric emit-load (arch type to-reg base-reg displacement))
+(defgeneric emit-store (arch type from-reg base-reg displacement))
+(defgeneric emit-address-load (arch to-reg base-reg displacement)
+  (:method (arch to-reg base-reg displacement)
+    (emit-load arch (arch-addrtype arch) to-reg base-reg displacement)))
+(defgeneric constant-fits-displacement (arch x))
+(defgeneric clamp-constant-to-fit-displacement (arch x))
+(defgeneric emit-extended-displacement-base-register-set (arch register x))
+
+;;;;
+;;;; Language-level
+;;;;
+(defclass language ()
+  ((name :reader lang-name :initarg :name)
+   (reserved-constants :reader lang-reserved-constants :initarg :reserved-constants)))
+
+(define-subcontainer const :type t)
+
+(defgeneric srctype-to-type (architecture language srctype))
+
+;;;;
 ;;;; Types
 ;;;;
 (deftype atomic-ctype () '(member integer char))
@@ -56,6 +86,7 @@
   (bitsize)
   (boundary)
   (bitboundary)
+  (srctype)
   (type nil :type (member :s8 :u8 :s16 :u18 :s32 :u32 :s64 :u64 :float :double-float :quad-float))
   (basetype)
   (nelts)
@@ -99,8 +130,7 @@ if there is no parent)."
   "Inserts an entry for the given symbol into the given symbol table and returns T,
 or if the symbol is already present, does not insert a new netry and returns NIL."
   (unless (locate-sym symtab x)
-    (setf (locate-sym symtab x) (make-symentry :name x))
-    t))
+    (setf (locate-sym symtab x) (make-symentry :name x))))
 
 (defun enclosing-symtab (symtab x)
   "Returns the nearest enclosing symbol table that declares X,
@@ -427,39 +457,36 @@ assigns a displacement and the frame pointer as the base register."
 ;;;;
 ;;;; Code, context
 ;;;;
-(defstruct (basic-block (:conc-name bb-))
+(defstruct (basic-block (:conc-name bb-) (:constructor %make-basic-block (pred succ)))
   (pred nil :type list)
   (succ nil :type list)
   (insts (make-array 0 :element-type 'inst :adjustable t)))
 
 (defstruct (procedure (:conc-name proc-))
   (name)
+  (lambda-list)
+  (parameters)
+  (nparams)
+  (nvalues)
+  (documentation)
+  (body)
+  (leafp)
+  (complete)
+  ;; Muchnik.
   (static-link-offset)
   (gsymtab (make-symtab))
   (depth)
   (blocks (make-array 0 :element-type 'basic-block :adjustable t) :type vector)
   (lblocks (make-array 0 :element-type 'basic-block :adjustable t) :type vector))
 
-(defclass load-store-architecture ()
-  ((loads :reader arch-loads :initarg :loads)
-   (stores :reader arch-stores :initarg :stores)
-   (addrtype :reader arch-addrtype :initarg :addrtype)))
-
-(defgeneric emit-register-move (arch to-reg from-reg))
-(defgeneric emit-load (arch type to-reg base-reg displacement))
-(defgeneric emit-store (arch type from-reg base-reg displacement))
-(defgeneric emit-address-load (arch to-reg base-reg displacement)
-  (:method (arch to-reg base-reg displacement)
-    (emit-load arch (arch-addrtype arch) to-reg base-reg displacement)))
-(defgeneric constant-fits-displacement (arch x))
-(defgeneric clamp-constant-to-fit-displacement (arch x))
-(defgeneric emit-extended-displacement-base-register-set (arch register x))
-
-(defclass ccontext (load-store-architecture)
+(defclass ccontext (language architecture)
   ((staticloc :accessor cctx-staticloc :initarg :staticloc)
-   (procs :reader cctx-procs :initarg :procs))
+   (procs :reader cctx-procs :initarg :procs)
+   (macros :reader cctx-macros :initarg :macros))
   (:default-initargs
-   :staticloc 0 :procs (make-hash-table :test 'eq)))
+   :staticloc 0 
+   :procs (make-hash-table :test 'eq)
+   :macros (make-hash-table :test 'eq)))
 
 (define-subcontainer proc :type procedure :iterator do-procs :container-slot procs)
 
@@ -509,15 +536,19 @@ instruction is a control transfer, in which case insert INST before it."
   (dolist (succ (bb-succ block))
     (setf (bb-pred succ) (union (bb-pred block) (remove block (bb-pred succ))))))
 
+(defun make-basic-block (proc pred succ)
+  "Make a basic block (an inconsitent one, admittedly) and insert it into PROC."
+  (with-slots (blocks) proc
+    (let ((i (length blocks)))
+      (setf blocks (adjust-array blocks (1+ i))
+            (aref blocks i) (%make-basic-block pred succ)))))
+
 ;;; XXXBOOK: doesn't insert the block into the array
 (defun insert-block (proc pred-block succ-block)
   "Split an edge by inserting a block with NINSTS instructions between the two given blocks."
   (with-slots (blocks) proc
-    (let ((i (length blocks))
-          (block (make-basic-block :pred (list pred-block) :succ (list succ-block))))
-      (setf blocks (adjust-array blocks (1+ i))
-            (aref blocks i) block
-            (bb-succ pred-block) (cons block (remove succ-block (bb-succ pred-block)))
+    (let ((block (make-basic-block proc (list pred-block) (list succ-block))))
+      (setf (bb-succ pred-block) (cons block (remove succ-block (bb-succ pred-block)))
             (bb-pred succ-block) (cons block (remove pred-block (bb-pred succ-block)))))))
 
 (defun delete-inst (proc block i)
@@ -612,25 +643,94 @@ BOOKTODO: register tracking."
     (with-symentry-properties (type disp) (locate-sym parent-symtab var)
       (gen-ldst proc cctx symtab type register disp t))))
 
+;;;;
+;;;; Frontend
+;;;;
+(defvar *sexp-path*)
+(defvar *compiled-procedure*)
+
+(defmacro with-noted-sexp-path (designator &body body)
+  `(let ((*sexp-path* (cons ,designator *sexp-path*)))
+     ,@body))
+
+(defmacro with-procedure-compilation ((procedure) &body body)
+  `(let ((*compiled-procedure* ,procedure))
+     ,@body))
+
+(defun expr-error (format-control &rest format-arguments)
+  (apply #'comp-error (format nil "~~@<In ~~S: ~A.~~:@>" format-control) *sexp-path* format-arguments))
+
+(defun compiler-note (format-control &rest format-arguments)
+  (apply #'format t (format nil "~~@<; ~~@;note: ~A.~~:@>~%" format-control) format-arguments))
+
+(defun note-redefinition (what in)
+  (compiler-note "redefining ~A in ~A" what in))
+
+;;;;
+;;;; Lisp frontend
+;;;;
+(defclass lisp-language (language)
+  ()
+  (:default-initargs 
+   :name :lisp
+   :reserved-constants (alist-hash-table `((t . t) (nil . t) (pi . ,pi)))))
+
+(defclass lisp-context (lisp-language context) ())
+
+(defmethod srctype-to-type (architecture (l lisp-language) srctype)
+  (arch-addrtype a))
+
+;;;;
+;;;; Frontend -> MIR
+;;;;
+(defun compile-defun (cctx name lambda-list body)
+  (labels ((validate-lambda-list (list)
+             (lret ((params (lambda-list-binds list)))
+               (when-let ((dups (set-difference params (remove-duplicates params))))
+                 (expr-error "duplicate entries in lambda list: ~S" dups))
+               (when-let ((consts (remove-if-not #'const params)))
+                 (expr-error "reserved constant names in lambda list: ~S" consts))))
+           (set-sym-srctype (symtab sym srctype &aux
+                                  (syment (locate-sym symtab sym)))
+             (setf (symentry-srctype syment) srctype
+                   (symentry-type syment) (srctype-to-type cctx cctx srctype)))
+           (add-params-to-global-symtab (proc params)
+             (dolist (p params)
+               (set-sym-srctype (proc-gsymtab proc) p t)))
+           (filter-type-declarations (decls)
+             (mapcar #'rest (remove-if-not (feq 'type) decls :key #'car)))
+           (note-type-declarations (proc decls)
+             (iter (for (type . vars) in decls)
+                   (when-let ((martians (set-difference vars (proc-parameters proc))))
+                     (expr-error "type declaration for unknown parameters ~S" martians))
+                   (dolist (v vars)
+                     (set-sym-srctype (proc-gsymtab proc) v type)))))
+    (with-noted-sexp-path `(defun ,name ,lambda-list ,@body)
+      ;; Make a temporary, incomplete function object for the purpose of recursion, with expression lacking proper code,
+      ;; and type being set to t.
+      (multiple-value-bind (docstring declarations body) (destructure-def-body body)
+        (lret* ((parameters (validate-lambda-list lambda-list))
+                (proc (make-procedure :name name :lambda-list lambda-list :parameters parameters :nparams (length parameters) :body body
+                                      :documentation docstring :leafp t :complete nil)))
+          (when (proc cctx name)
+            (note-redefinition name 'defun))
+          (setf (proc cctx name) proc)
+          (with-procedure-compilation (proc)
+            (with-slots (gsymtab) proc
+              (add-params-to-global-symtab proc parameters)
+              (let ((bb (make-basic-block proc nil nil))
+                    (type-decls (filter-type-declarations declarations)))
+                (append-to-block bb (make-label name))
+                (note-type-declarations proc type-decls)
+                (dolist (p parameters)
+                  (append-to-block bb (make-receive p (symentry-type (locate-sym gsymtab p)))))
+                (compile-progn cctx proc gsymtab (butlast body))
+                (compile-return cctx proc gsymtab (lastcar body))
+                (setf (proc-complete proc) t)))))))))
+
 ;;;
 ;;; IR1
 ;;;
-(defun comp-typep (x type)
-  (if (consp type)
-      (ecase (first type)
-        (and (not (null (every (curry #'comp-typep x) (rest type)))))
-        (or (not (null (some (curry #'comp-typep x) (rest type))))))
-      (ecase type
-        (boolean (member x '(t nil)))
-        (integer (typep x '(unsigned-byte 32)))
-        (nil nil)
-        ((t) t))))
-
-(defun comp-type-of (x)
-  (cond ((member x '(t nil)) 'boolean)
-        ((typep x '(unsigned-byte 32)) 'integer)
-        (t t)))
-
 (defun comp-simplify-logical-expression (x &aux (pass-list '(fold-constants remove-duplicates unnest-similars detrivialize recurse)))
   (cond ((atom x) x)
         ((= 2 (length x)) (comp-simplify-logical-expression (second x)))
@@ -679,6 +779,22 @@ BOOKTODO: register tracking."
                                                      x-body processed-x-body)))
                                         (go loop))
                                       (return-from machine-collector x-body))))))))))
+
+(defun comp-typep (x type)
+  (if (consp type)
+      (ecase (first type)
+        (and (not (null (every (curry #'comp-typep x) (rest type)))))
+        (or (not (null (some (curry #'comp-typep x) (rest type))))))
+      (ecase type
+        (boolean (member x '(t nil)))
+        (integer (typep x '(unsigned-byte 32)))
+        (nil nil)
+        ((t) t))))
+
+(defun comp-type-of (x)
+  (cond ((member x '(t nil)) 'boolean)
+        ((typep x '(unsigned-byte 32)) 'integer)
+        (t t)))
 
 (defclass var ()
   ((name :accessor var-name :initarg :name)))
@@ -752,24 +868,6 @@ BOOKTODO: register tracking."
 (defclass expr-var (var)
   ((expr :accessor var-expr :type expr :initarg :expr)))
 
-(defclass func ()
-  ((name :accessor func-name :type symbol :initarg :name)
-   (nargs :accessor func-nargs :type (integer 0) :initarg :nargs)
-   (nvalues :accessor func-nvalues :type (integer 0) :initarg :nvalues)
-   (leafp :accessor func-leafp :type boolean :initarg :leafp)))
-
-(defclass primop (expr-like func)
-  ((valuep :accessor primop-valuep :type boolean :initarg :valuep)
-   (instantiator :accessor primop-instantiator :type function :initarg :instantiator)
-   (folder :accessor primop-folder :type function :initarg :folder)
-   (papplicable-p :accessor primop-papplicable-p :type function :initarg :papplicable-p)
-   (papplicator :accessor primop-papplicator :type function :initarg :papplicator)))
-
-(defclass expr-func (func)
-  ((lambda-list :accessor func-lambda-list :type list :initarg :lambda-list)
-   (expr :accessor func-expr :type expr :initarg :expr)
-   (complete :accessor func-complete :type boolean :initarg :complete)))
-
 (defmethod expr-type ((o expr-func)) (expr-type (func-expr o)))
 (defmethod expr-effect-free ((o expr-func)) (expr-effect-free (func-expr o)))
 (defmethod expr-pure ((o expr-func)) (expr-pure (func-expr o)))
@@ -781,9 +879,6 @@ BOOKTODO: register tracking."
 
 (define-root-container *primops* primop :if-exists :error)
 
-(defclass compenv ()
-  ((functions :accessor compenv-functions :initform (make-hash-table :test 'eq))
-   (macros :accessor compenv-macros :initform (make-hash-table :test 'eq))))
 (define-subcontainer func :container-slot functions :type expr-func :if-exists :error)
 (define-subcontainer macro :container-slot macros :type function :if-exists :error)
 
@@ -800,19 +895,6 @@ BOOKTODO: register tracking."
 
 (defun make-frame-from-var-names (var-names dominator)
   (make-frame-from-vars (mapcar (curry #'make-instance 'var :name) var-names) dominator))
-
-(defvar *sexp-path* nil)
-
-(defmacro with-noted-sexp-path (designator &body body)
-  `(let ((*sexp-path* (cons ,designator *sexp-path*)))
-     (declare (special *sexp-path*))
-     ,@body))
-
-(defun expr-error (format-control &rest format-arguments)
-  (apply #'comp-error (format nil "~~@<In ~~S: ~A.~~:@>" format-control) *sexp-path* format-arguments))
-
-(defun compiler-note (format-control &rest format-arguments)
-  (apply #'format t (format nil "~~@<; ~~@;note: ~A.~~:@>~%" format-control) format-arguments))
 
 ;;;
 ;;; IR2
@@ -1167,30 +1249,6 @@ BOOKTODO: register tracking."
         (format t "~@<Prepending ~S to producers.~:@>~%" producers)
         (append producers acc-producers))
       soup))))
-
-;;; NOTE: the expression doesn't contain the label, which must be emitted by the linker.
-(defun compile-defun (name lambda-list body compenv)
-  (with-noted-sexp-path `(defun ,name ,lambda-list ,@body)
-    ;; Make a temporary, incomplete function object for the purpose of recursion, with expression lacking proper code,
-    ;; and type being set to t.
-    (let ((func (make-instance 'expr-func :name name :nargs (length lambda-list) :lambda-list lambda-list :leafp t :complete nil
-                               :expr (make-instance 'expr :effect-free nil :pure nil :value-used t :env nil
-                                                    :type t :form `(defun ,name ,lambda-list #:phony) :code nil))))
-      (setf (func compenv name) func)
-      (multiple-value-bind (docstring declarations body) (destructure-def-body body)
-        (declare (ignore docstring))
-        (lret ((type-decls (mapcar #'rest (remove-if-not (feq 'type) declarations :key #'car)))
-              (*compiled-function* func))
-          (declare (special *compiled-function*))
-          (setf (func-expr func)
-                (compile-let (iter (for arg-name in lambda-list)
-                                   (for i from 0)
-                                   (collect `(,arg-name (funarg-ref ,i ,(or (first (find name type-decls :key #'rest :test #'member)) t)))))
-                             body
-                             compenv nil t t)
-                (func-complete func) t)
-          ;; #+(or)
-          (build-data-flow-graph nil (func-expr func) nil nil))))))
 
 (defun compile-if (clauses compenv lexenv valuep tailp)
   (let ((n-args (length clauses)))
