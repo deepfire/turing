@@ -30,7 +30,6 @@
 ;;;;
 ;;;; Target-architecture-level
 ;;;;
-
 (defclass architecture ()
   ((loads :reader arch-loads :initarg :loads)
    (stores :reader arch-stores :initarg :stores)
@@ -45,161 +44,6 @@
 (defgeneric constant-fits-displacement (arch x))
 (defgeneric clamp-constant-to-fit-displacement (arch x))
 (defgeneric emit-extended-displacement-base-register-set (arch register x))
-
-;;;;
-;;;; Language-level
-;;;;
-(defclass language ()
-  ((name :reader lang-name :initarg :name)
-   (reserved-constants :reader lang-reserved-constants :initarg :reserved-constants)))
-
-(define-subcontainer const :type t)
-
-(defgeneric srctype-to-type (architecture language srctype))
-
-;;;;
-;;;; Types
-;;;;
-(deftype atomic-ctype () '(member integer char))
-(defstruct (compound-ctype (:conc-name ctype-))
-  (constructor)
-  (arity))
-(defstruct (array-ctype (:include compound-ctype) (:conc-name ctype-))
-  (base-type)
-  (dimensions))
-(defstruct (record-ctype (:include compound-ctype) (:conc-name ctype-))
-  (fields))
-(deftype ctype () '(or compound-ctype atomic-ctype))
-
-(defclass ctype-env ()
-  ((ctypes :initform (make-hash-table :test 'eq))))
-
-(define-subcontainer ctype :container-slot ctypes)
-
-;;;;
-;;;; Symbol table
-;;;;
-(defstruct symentry
-  (name)
-  (class nil :type (member :local :local-static))
-  (size)
-  (bitsize)
-  (boundary)
-  (bitboundary)
-  (srctype)
-  (type nil :type (member :s8 :u8 :s16 :u18 :s32 :u32 :s64 :u64 :float :double-float :quad-float))
-  (basetype)
-  (nelts)
-  (machtype)
-  (props (make-hash-table :test 'equal)))
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *direct-properties* '(name class size bitsize boundary bitboundary type basetype nelts machtype)))
-
-(define-subcontainer symprop :type t :container-slot props :if-does-not-exist :continue)
-
-(defmacro with-symentry-properties (properties entry &body body)
-  (multiple-value-bind (direct indirect) (unzip (rcurry #'member *direct-properties*) properties)
-    (once-only (entry)
-      `(symbol-macrolet ,(iter (for s in indirect)
-                               (collect `(,s `(symprop ,,entry ,',s))))
-         (with-slots ,direct ,entry
-           ,@body)))))
-
-(defstruct (symtab (:constructor %make-symtab (parent)))
-  (parent nil :type (or null symtab))
-  (syms (make-hash-table :test 'equal) :type hash-table)
-  (childs nil :type list))
-
-(define-subcontainer locate-sym :container-slot syms :key-type string :type symentry :if-exists :continue :if-does-not-exist :continue
-                     :iterator do-symtab-entries)
-
-(defun make-symtab (&optional parent)
-  "Creates a new local symbol table with the given symtol table as its parent,
-or NIL if there is none, and returns the new (empty) local symbol table."
-  (%make-symtab parent))
-
-(defun dest-symtab (x)
-  "Destroys the current local symbol table and returns its parent (or nil
-if there is no parent)."
-  (when-let ((parent (symtab-parent x)))
-    (removef x (symtab-childs parent))
-    parent))
-
-(defun insert-sym (symtab x)
-  "Inserts an entry for the given symbol into the given symbol table and returns T,
-or if the symbol is already present, does not insert a new netry and returns NIL."
-  (unless (locate-sym symtab x)
-    (setf (locate-sym symtab x) (make-symentry :name x))))
-
-(defun enclosing-symtab (symtab x)
-  "Returns the nearest enclosing symbol table that declares X,
-or NIL if there is none."
-  (labels ((rec (symtab)
-             (or (when (locate-sym symtab x)
-                   symtab)
-                 (when-let ((parent (symtab-parent symtab)))
-                   (rec parent)))))
-    (rec symtab)))
-
-(defun depth-of-symtab (symtab)
-  "Returns the depth of the given symbol table relative to the current one,
-which, by convention, has depth zero."
-  (labels ((rec (depth symtab)
-             (if-let ((parent (symtab-parent symtab)))
-               (rec (1+ depth) parent)
-               depth)))
-    (rec 0 symtab)))
-
-;;;;
-;;;; Storage binding
-;;;;
-(defun round-abs-up (m n)
-  "Ensure that M is aligned by N."
-  (* (signum m) (ceiling (abs (coerce (/ m n) 'float))) (abs n)))
-
-(defun bind-local-vars (cctx symtab initdisp)
-  "Assign each static variable a displacement and, for stack-allocated variables,
-assigns a displacement and the frame pointer as the base register."
-  (let ((stackloc initdisp)
-        ;; Sort frame entries in order of decreasing alignment requirements.
-        ;; When we overflow load/store displacement constants, this becomes
-        ;; a size vs. speed tradeoff -- reverting this order, while maintaining
-        ;; alignment requirements allows us to access more frame locals, with
-        ;; a negligible size loss.
-        ;; XXX: we should default to that, actually.
-        (alignment-sorted-entries (sort (do-symtab-entries (s symtab) (collect s))
-                                        #'> :key #'symentry-size)))
-    (dolist (entry alignment-sorted-entries)
-      (with-slots (class size basetype nelts) entry
-        (ecase class
-          (:local
-           (case basetype
-             (:record
-              (dotimes (i nelts)
-                (let ((field-size (symprop entry `(,i size))))
-                  (decf stackloc field-size)
-                  (setf stackloc (round-abs-up stackloc field-size)
-                        (symprop entry 'reg) "fp"
-                        (symprop entry `(,i disp)) stackloc))))
-             (t
-              (decf stackloc size)
-              (setf stackloc (round-abs-up stackloc size)
-                    (symprop entry 'reg) "fp"
-                    (symprop entry 'disp) stackloc))))
-          (:local-static
-           (with-slots (static-link-offset) cctx
-             (case basetype
-               (:record
-                (dotimes (i nelts)
-                  (let ((field-size (symprop entry `(,i size))))
-                    (setf static-link-offset (round-abs-up static-link-offset field-size)
-                          (symprop entry `(,i disp)) static-link-offset)
-                    (incf static-link-offset field-size))))
-               (t
-                (setf static-link-offset (round-abs-up static-link-offset size)
-                      (symprop entry 'disp) static-link-offset)
-                (incf static-link-offset size))))))))))
 
 ;;;;
 ;;;; Operands
@@ -382,13 +226,16 @@ assigns a displacement and the frame pointer as the base register."
 (defmacro define-lir-memaddr-inst (short-name name lambda-list &optional print-spec)
   `(define-inst lir-memaddr-inst ,short-name ,name ,lambda-list ,print-spec))
 
+;;; LOOP
 (define-hir-inst :for         for                                (varname <- operand1 operand2 operand3)               "for ~(~A~) <- ~(~A~) by ~(~A~) to ~(~A~) do")
 (define-hir-inst :endfor      endfor                             ()                                                    "endfor")
+;;; IF
 (define-hir-inst :strbinif    binary-hir-condition               (operand1 binop operand2)                             "if ~(~A~) ~A ~(~A~) then")
 (define-hir-inst :strunif     unary-hir-condition                (unop operand)                                        "if ~A ~(~A~) then")
 (define-hir-inst :strvalif    value-hir-condition                (operand)                                             "if ~(~A~) then")
 (define-hir-inst :else        else                               ()                                                    "else")
 (define-hir-inst :endif       endif                              ()                                                    "endif")
+;;; ARRAY
 (define-hir-inst :arybinasgn  array-binary-assignment            (varname &rest subscripts <- operand1 binop operand2) "~(~A~)[~{, ~A~}] <- ~(~A~) ~A ~(~A~)")
 (define-hir-inst :aryunasgn   array-unary-assignment             (varname &rest subscripts <- binop operand)           "~(~A~)[~{, ~A~}] <- ~A ~(~A~)")
 (define-hir-inst :aryvalasgn  array-value-assignment             (varname &rest subscripts <- operand)                 "~(~A~)[~{, ~A~}] <- ~(~A~)")
@@ -396,8 +243,16 @@ assigns a displacement and the frame pointer as the base register."
 ;;; BOOK: aryref kind unspecified (and leftness, but it's obvious)
 
 
+;;; LABEL/GOTO
 (define-mir-inst :label       label                              (label)                                               ":~(~A~)")
+(define-mir-inst :goto        goto                               (label)                                               "goto ~(~A~)")
+;;; PROCEDURE
 (define-mir-inst :receive     receive                            (varname <- typename)                                 "receive ~(~A~)(~A)")
+(define-mir-inst :return      just-return                        ()                                                    "return")
+(define-mir-inst :retval      return-value                       (operand)                                             "return ~(~A~)")
+(define-mir-inst :call        call                               (procname &rest args)                                 "call ~(~A~)~{ ~A~}")
+(define-mir-inst :callasgn    call-assignment                    (varname <- procname &rest args)                      "~(~A~) <- call ~(~A~)~{ ~A~}")
+;;; ASSIGNMENT
 (define-mir-inst :binasgn     binary-assignment                  (varname <- operand1 binop operand2)                  "~(~A~) <- ~(~A~) ~A ~(~A~)")
 (define-mir-inst :unasgn      unary-assignment                   (varname <- unop operand)                             "~(~A~) <- ~A ~(~A~)")
 (define-mir-inst :valasgn     value-assignment                   (varname <- operand)                                  "~(~A~) <- ~(~A~)")
@@ -406,23 +261,31 @@ assigns a displacement and the frame pointer as the base register."
 (define-mir-inst :indasgn     indirected-assignment              (varname <- operand)                                  "*~(~A~) <- ~(~A~)")
 (define-mir-inst :eltasgn     element-assignment                 (varname eltname <- operand)                          "~(~A~).~(~A~) <- ~(~A~)")
 (define-mir-inst :indeltasgn  indirect-element-assignment        (varname eltname <- operand)                          "*~(~A~).~(~A~) <- ~(~A~)")
-(define-mir-inst :goto        goto                               (label)                                               "goto ~(~A~)")
+;;; CONDITIONAL CONTROL TRANSFERS
 (define-mir-inst :binif       binary-condition                   (operand1 binop operand2 label)                       "if ~(~A~) ~A ~(~A~) goto ~(~A~)")
 (define-mir-inst :unif        unary-condition                    (unop operand label)                                  "if ~A ~(~A~) goto ~(~A~)")
 (define-mir-inst :valif       value-condition                    (operand label)                                       "if ~(~A~) goto ~(~A~)")
+;;; OS
 (define-mir-inst :bintrap     binary-trap                        (operand1 binop operand2 trapno)                      "if ~(~A~) ~A ~(~A~) trap #x~X")
 (define-mir-inst :untrap      unary-trap                         (unop operand trapno)                                 "if ~A ~(~A~) trap #x~X")
 (define-mir-inst :valtrap     value-trap                         (operand trapno)                                      "if ~(~A~) trap #x~X")
-(define-mir-inst :call        call                               (procname &rest args)                                 "call ~(~A~)~{ ~A~}")
-(define-mir-inst :callasgn    call-assignment                    (varname <- procname &rest args)                      "~(~A~) <- call ~(~A~)~{ ~A~}")
-(define-mir-inst :return      just-return                        ()                                                    "return")
-(define-mir-inst :retval      return-value                       (operand)                                             "return ~(~A~)")
+;;; ...
 (define-mir-inst :sequence    memory-barrier                     ()                                                    "sequence")
 (define-mir-inst :var         variable-reference                 (varname)                                             "~(~A~)")
 (define-mir-inst :const       constant-value                     (const)                                               "~(~A~)")
 (define-mir-inst :tn          type-name                          (typename)                                            "~(~A~)")
 
-;; label skipped
+;;; LABEL/GOTO
+(define-lir-inst :lir-label   lir-label                          (label)                                               ":~(~A~)")
+(define-lir-inst :lir-goto    lir-goto                           (label)                                               "goto ~(~A~)")
+(define-lir-inst :gotoaddr    computed-goto                      (regname integer)                                     "goto ~(~A~) + #x~X")
+;;; PROCEDURE
+(define-lir-inst :callreg     constant-call                      (procname regname)                                    "call ~(~A~) ~(~A~)")
+(define-lir-inst :callreg2    register-call                      (regname1 regname2)                                   "call ~(~A~) ~(~A~)")
+(define-lir-inst :callregasgn constant-call-assignment           (regname1 <- procname regname2)                       "~(~A~) <- call ~(~A~) ~(~A~)")
+(define-lir-inst :callreg3    register-call-assignment           (regname1 <- regname2 regname3)                       "~(~A~) <- call ~(~A~) ~(~A~)")
+(define-lir-inst :lirretval   lir-return-value                   (liroperand)                                          "return ~(~A~)")
+;;; ASSIGNMENT
 (define-lir-inst :regbin      register-binary-assignment         (regname <- liroperand1 binop liroperand2)            "~(~A~) <- ~(~A~) ~A~(~A~)")
 (define-lir-inst :regun       register-unary-assignment          (regname <- unop liroperand)                          "~(~A~) <- ~A ~(~A~)")
 (define-lir-inst :regval      register-value-assignment          (regname <- liroperand)                               "~(~A~) <- ~(~A~)")
@@ -433,19 +296,15 @@ assigns a displacement and the frame pointer as the base register."
 (define-lir-inst :stormem     memory-store                       (memaddr <- liroperand)                               "~A <- ~(~A~)")
 ;; XXX: memaddr on the left -> not a real left
 (define-lir-inst :loadmem     memory-load                        (regname <- memaddr)                                  "~(~A~) <- ~A")
-(define-lir-inst :lirgoto     lir-goto                           (label)                                               "goto ~(~A~)")
-(define-lir-inst :gotoaddr    computed-goto                      (regname integer)                                     "goto ~(~A~) + #x~X")
+;;; CONDITIONAL CONTROL TRANSFERS
 (define-lir-inst :regbinif    register-binary-condition          (liroperand1 binop liroperand2 label)                 "if ~(~A~) ~A ~(~A~) goto ~(~A~)")
 (define-lir-inst :regunif     register-unary-condition           (unop liroperand label)                               "if ~A ~(~A~) goto ~(~A~)")
 (define-lir-inst :regvalif    register-value-condition           (liroperand label)                                    "if ~(~A~) goto ~(~A~)")
+;;; OS
 (define-lir-inst :lir-bintrap lir-register-binary-trap           (liroperand1 binop liroperand2 trapno)                "if ~(~A~) ~A ~(~A~) trap #x~X")
 (define-lir-inst :lir-untrap  lir-register-unary-trap            (unop liroperand trapno)                              "if ~A ~(~A~) trap #x~X")
 (define-lir-inst :lir-valtrap lir-register-value-trap            (liroperand trapno)                                   "if ~(~A~) trap #x~X")
-(define-lir-inst :callreg     constant-call                      (procname regname)                                    "call ~(~A~) ~(~A~)")
-(define-lir-inst :callreg2    register-call                      (regname1 regname2)                                   "call ~(~A~) ~(~A~)")
-(define-lir-inst :callregasgn constant-call-assignment           (regname1 <- procname regname2)                       "~(~A~) <- call ~(~A~) ~(~A~)")
-(define-lir-inst :callreg3    register-call-assignment           (regname1 <- regname2 regname3)                       "~(~A~) <- call ~(~A~) ~(~A~)")
-(define-lir-inst :lirretval   lir-return-value                   (liroperand)                                          "return ~(~A~)")
+;;; ...
 (define-lir-inst :regno       register-reference                 (regname)                                             "~(~A~)")
 (define-lir-inst :lirtn       lir-type-name                      (typename)                                            "~(~A~)")
 ;; BOOK: LIR typename vs. MIR TNi
@@ -453,6 +312,161 @@ assigns a displacement and the frame pointer as the base register."
 (define-lir-memaddr-inst :addr1r register-memory-reference          (regname length)                                   "[~(~A~)](~A)")
 (define-lir-memaddr-inst :addr2r register-register-memory-reference (regname1 regname2 length)                         "[~(~A~)+~(~A~)](~A)")
 (define-lir-memaddr-inst :addrrc register-constant-memory-reference (regname integer length)                           "[~(~A~)+~(~A~)](~A)")
+
+;;;;
+;;;; Language-level
+;;;;
+(defclass language ()
+  ((name :reader lang-name :initarg :name)
+   (reserved-constants :reader lang-reserved-constants :initarg :reserved-constants)))
+
+(define-subcontainer const :type t)
+
+(defgeneric srctype-to-type (architecture language srctype))
+
+;;;;
+;;;; Types
+;;;;
+(deftype atomic-ctype () '(member integer char))
+(defstruct (compound-ctype (:conc-name ctype-))
+  (constructor)
+  (arity))
+(defstruct (array-ctype (:include compound-ctype) (:conc-name ctype-))
+  (base-type)
+  (dimensions))
+(defstruct (record-ctype (:include compound-ctype) (:conc-name ctype-))
+  (fields))
+(deftype ctype () '(or compound-ctype atomic-ctype))
+
+(defclass ctype-env ()
+  ((ctypes :initform (make-hash-table :test 'eq))))
+
+(define-subcontainer ctype :container-slot ctypes)
+
+;;;;
+;;;; Symbol table
+;;;;
+(defstruct symentry
+  (name)
+  (class nil :type (member :local :local-static))
+  (size)
+  (bitsize)
+  (boundary)
+  (bitboundary)
+  (srctype)
+  (type nil :type (member :s8 :u8 :s16 :u18 :s32 :u32 :s64 :u64 :float :double-float :quad-float))
+  (basetype)
+  (nelts)
+  (machtype)
+  (props (make-hash-table :test 'equal)))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *direct-properties* '(name class size bitsize boundary bitboundary type basetype nelts machtype)))
+
+(define-subcontainer symprop :type t :container-slot props :if-does-not-exist :continue)
+
+(defmacro with-symentry-properties (properties entry &body body)
+  (multiple-value-bind (direct indirect) (unzip (rcurry #'member *direct-properties*) properties)
+    (once-only (entry)
+      `(symbol-macrolet ,(iter (for s in indirect)
+                               (collect `(,s `(symprop ,,entry ,',s))))
+         (with-slots ,direct ,entry
+           ,@body)))))
+
+(defstruct (symtab (:constructor %make-symtab (parent)))
+  (parent nil :type (or null symtab))
+  (syms (make-hash-table :test 'equal) :type hash-table)
+  (childs nil :type list))
+
+(define-subcontainer locate-sym :container-slot syms :key-type string :type symentry :if-exists :continue :if-does-not-exist :continue
+                     :iterator do-symtab-entries)
+
+(defun make-symtab (&optional parent)
+  "Creates a new local symbol table with the given symtol table as its parent,
+or NIL if there is none, and returns the new (empty) local symbol table."
+  (%make-symtab parent))
+
+(defun dest-symtab (x)
+  "Destroys the current local symbol table and returns its parent (or nil
+if there is no parent)."
+  (when-let ((parent (symtab-parent x)))
+    (removef x (symtab-childs parent))
+    parent))
+
+(defun insert-sym (symtab x)
+  "Inserts an entry for the given symbol into the given symbol table and returns T,
+or if the symbol is already present, does not insert a new netry and returns NIL."
+  (unless (locate-sym symtab x)
+    (setf (locate-sym symtab x) (make-symentry :name x))))
+
+(defun enclosing-symtab (symtab x)
+  "Returns the nearest enclosing symbol table that declares X,
+or NIL if there is none."
+  (labels ((rec (symtab)
+             (or (when (locate-sym symtab x)
+                   symtab)
+                 (when-let ((parent (symtab-parent symtab)))
+                   (rec parent)))))
+    (rec symtab)))
+
+(defun depth-of-symtab (symtab)
+  "Returns the depth of the given symbol table relative to the current one,
+which, by convention, has depth zero."
+  (labels ((rec (depth symtab)
+             (if-let ((parent (symtab-parent symtab)))
+               (rec (1+ depth) parent)
+               depth)))
+    (rec 0 symtab)))
+
+;;;;
+;;;; Storage binding
+;;;;
+(defun round-abs-up (m n)
+  "Ensure that M is aligned by N."
+  (* (signum m) (ceiling (abs (coerce (/ m n) 'float))) (abs n)))
+
+(defun bind-local-vars (cctx symtab initdisp)
+  "Assign each static variable a displacement and, for stack-allocated variables,
+assigns a displacement and the frame pointer as the base register."
+  (let ((stackloc initdisp)
+        ;; Sort frame entries in order of decreasing alignment requirements.
+        ;; When we overflow load/store displacement constants, this becomes
+        ;; a size vs. speed tradeoff -- reverting this order, while maintaining
+        ;; alignment requirements allows us to access more frame locals, with
+        ;; a negligible size loss.
+        ;; XXX: we should default to that, actually.
+        (alignment-sorted-entries (sort (do-symtab-entries (s symtab) (collect s))
+                                        #'> :key #'symentry-size)))
+    (dolist (entry alignment-sorted-entries)
+      (with-slots (class size basetype nelts) entry
+        (ecase class
+          (:local
+           (case basetype
+             (:record
+              (dotimes (i nelts)
+                (let ((field-size (symprop entry `(,i size))))
+                  (decf stackloc field-size)
+                  (setf stackloc (round-abs-up stackloc field-size)
+                        (symprop entry 'reg) "fp"
+                        (symprop entry `(,i disp)) stackloc))))
+             (t
+              (decf stackloc size)
+              (setf stackloc (round-abs-up stackloc size)
+                    (symprop entry 'reg) "fp"
+                    (symprop entry 'disp) stackloc))))
+          (:local-static
+           (with-slots (static-link-offset) cctx
+             (case basetype
+               (:record
+                (dotimes (i nelts)
+                  (let ((field-size (symprop entry `(,i size))))
+                    (setf static-link-offset (round-abs-up static-link-offset field-size)
+                          (symprop entry `(,i disp)) static-link-offset)
+                    (incf static-link-offset field-size))))
+               (t
+                (setf static-link-offset (round-abs-up static-link-offset size)
+                      (symprop entry 'disp) static-link-offset)
+                (incf static-link-offset size))))))))))
 
 ;;;;
 ;;;; Code, context
@@ -727,6 +741,59 @@ BOOKTODO: register tracking."
                 (compile-progn cctx proc gsymtab (butlast body))
                 (compile-return cctx proc gsymtab (lastcar body))
                 (setf (proc-complete proc) t)))))))))
+
+(defun compile-constant (cctx proc expr valuep tailp)
+  (when valuep
+    (with-return-wrapped-if tailp
+      (make-instance 'expr :effect-free t :pure t :value-used t :env nil
+                     :type (comp-type-of expr) :branching nil :form expr
+                     :code
+                     (emit-constant (case expr
+                                      ((t) 1)
+                                      ((nil) 0)
+                                      (t expr)))))))
+
+(defun compile-expr (cctx proc symtab expr valuep tailp)
+  (when *comp-verbose*
+    (compiler-note "compiling ~S" expr))
+  (cond ((constant-p expr) (compile-constant     cctx proc        expr valuep tailp))
+        ((symbolp expr)    (compile-variable-ref cctx proc symtab expr valuep tailp))
+        ((atom expr)       (expr-error "atom ~S has unsupported type ~S" expr (type-of expr)))
+        (t
+         (case (car expr)
+           (progn (compile-progn cctx proc symtab (rest expr) valuep tailp))
+           (if    (compile-if    cctx proc symtab (rest expr) valuep tailp))
+           (let   (compile-let   cctx proc symtab (second expr) (cddr expr) valuep tailp))
+           #+nil (tagbody) #+nil (go)
+           #+nil (block)
+           #+nil (catch)   #+nil (throw)
+           #+nil (unwind-protect)
+           (t
+            (destructuring-bind (name &rest body) expr
+              (if-let ((macro (macro cctx name :if-does-not-exist :continue)))
+                (compile-expr    cctx proc symtab (apply macro body) valuep tailp)
+                (compile-funcall cctx proc symtab name body          valuep tailp))))))))
+
+(defun compile-progn (cctx proc symtab exprs)
+  (if exprs
+      (let* ((for-effect (remove nil (mapcar (rcurry #'compile-expr compenv lexenv nil nil) (butlast expr))))
+             (for-value (compile-expr (lastcar expr) compenv lexenv tailp valuep))
+             (effect-free (and (null for-effect) (expr-effect-free for-value)))
+             (pure (and effect-free (expr-pure for-value))))
+        (when (or valuep (not effect-free))
+          (make-instance 'expr :effect-free effect-free :pure pure :value-used valuep :env lexenv
+                         :type (expr-type for-value) :form `(progn ,@expr)
+                         :branching (cond ((find :funcall for-effect :key #'expr-branching) :funcall)
+                                          ((find :tail for-effect :key #'expr-branching) :non-tail)
+                                          ((find :non-tail for-effect :key #'expr-branching) :non-tail)
+                                          (for-value (expr-branching for-value)))
+                         :code
+                         (append for-effect
+                                 ;; for-value is NIL iff (and (not valuep) (expr-effect-free for-value-expr))
+                                 ;; which implies (not tail)
+                                 (when for-value
+                                   (list for-value))))))
+      (compile-constant nil valuep tailp)))
 
 ;;;
 ;;; IR1
@@ -1049,19 +1116,6 @@ BOOKTODO: register tracking."
 (defmacro with-return-wrapped-if (wrap-p &body expr)
   `(maybe-wrap-with-return ,wrap-p ,@expr))
 
-(defun compile-constant (expr valuep tailp)
-  (unless (constant-p expr)
-    (expr-error "attempted to compile non-constant expression ~S as constant" expr))
-  (when valuep
-    (with-return-wrapped-if tailp
-      (make-instance 'expr :effect-free t :pure t :value-used t :env nil
-                     :type (comp-type-of expr) :branching nil :form expr
-                     :code
-                     (emit-constant (case expr
-                                      ((t) 1)
-                                      ((nil) 0)
-                                      (t expr)))))))
-
 (defun compile-variable-ref (var lexenv valuep tailp)
   (with-noted-sexp-path var
     (unless (env-boundp var lexenv)
@@ -1140,27 +1194,6 @@ BOOKTODO: register tracking."
 ;;;
 ;;; Non-leaf expressions
 ;;;
-(defun compile-progn (expr compenv lexenv valuep tailp)
-  (if expr
-      (let* ((for-effect (remove nil (mapcar (rcurry #'compile-expr compenv lexenv nil nil) (butlast expr))))
-             (for-value (compile-expr (lastcar expr) compenv lexenv tailp valuep))
-             (effect-free (and (null for-effect) (expr-effect-free for-value)))
-             (pure (and effect-free (expr-pure for-value))))
-        (when (or valuep (not effect-free))
-          (make-instance 'expr :effect-free effect-free :pure pure :value-used valuep :env lexenv
-                         :type (expr-type for-value) :form `(progn ,@expr)
-                         :branching (cond ((find :funcall for-effect :key #'expr-branching) :funcall)
-                                          ((find :tail for-effect :key #'expr-branching) :non-tail)
-                                          ((find :non-tail for-effect :key #'expr-branching) :non-tail)
-                                          (for-value (expr-branching for-value)))
-                         :code
-                         (append for-effect
-                                 ;; for-value is NIL iff (and (not valuep) (expr-effect-free for-value-expr))
-                                 ;; which implies (not tail)
-                                 (when for-value
-                                   (list for-value))))))
-      (compile-constant nil valuep tailp)))
-
 ;;; For now, we can't rely much on VAR-EXPR.
 (defun compile-let (bindings body compenv lexenv valuep tailp)
   (with-noted-sexp-path 'let
@@ -1293,25 +1326,6 @@ BOOKTODO: register tracking."
                                           (list else-code)
                                           (unless tailp
                                             (emit-label end-label))))))))))))
-
-(defun compile-expr (expr compenv lexenv valuep tailp)
-  (when *comp-verbose*
-    (compiler-note "compiling ~S" expr))
-  (cond ((constant-p expr) (compile-constant expr valuep tailp))
-        ((symbolp expr) (compile-variable-ref expr lexenv valuep tailp))
-        ((atom expr)
-         (expr-error "atom ~S has unsupported type ~S" expr (type-of expr)))
-        (t
-         (case (car expr)
-           (progn (compile-progn (rest expr) compenv lexenv valuep tailp))
-           (if (compile-if (rest expr) compenv lexenv valuep tailp))
-           (let (if (null (second expr))
-                    (compile-progn (cddr expr) compenv lexenv valuep tailp)
-                    (compile-let (second expr) (cddr expr) compenv lexenv valuep tailp)))
-           (t
-            (if-let ((macro (macro compenv (car expr) :if-does-not-exist :continue)))
-              (compile-expr (apply macro (cdr expr)) compenv lexenv valuep tailp)
-              (compile-funcall (car expr) (rest expr) compenv lexenv valuep tailp)))))))
 
 (defun compile-toplevel (expr compenv)
   (compiler-note "compiling toplevel: ~S" expr)
