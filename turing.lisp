@@ -359,6 +359,11 @@
   (nelts)
   (machtype)
   (props (make-hash-table :test 'equal)))
+;;;;
+;;;; BIG FAT WARNING:
+;;;; the code below uses SYMENTRYes with :SYMBOL-MACRO srctype,
+;;;; which messes up concepts pretty much fatally.
+;;;;
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defvar *direct-properties* '(name class size bitsize boundary bitboundary type basetype nelts machtype)))
@@ -495,14 +500,20 @@ assigns a displacement and the frame pointer as the base register."
 
 (defclass ccontext (language architecture)
   ((staticloc :accessor cctx-staticloc :initarg :staticloc)
+   (ggsymtab :accessor cctx-ggsymtab :initarg :ggsymtab)
    (procs :reader cctx-procs :initarg :procs)
-   (macros :reader cctx-macros :initarg :macros))
+   (macros :reader cctx-macros :initarg :macros)
+   (compmacros :reader cctx-compmacros :initarg :compmacros))
   (:default-initargs
    :staticloc 0 
+   :ggsymtab (make-symtab)
    :procs (make-hash-table :test 'eq)
-   :macros (make-hash-table :test 'eq)))
+   :macros (make-hash-table :test 'eq)
+   :compmacros (make-hash-table :test 'eq)))
 
 (define-subcontainer proc :type procedure :iterator do-procs :container-slot procs)
+(define-subcontainer macro :type function :iterator do-macros :container-slot macros)
+(define-subcontainer compmacro :type function :iterator do-compmacros :container-slot compmacros)
 
 ;;;;
 ;;;; Basic block machinery
@@ -660,19 +671,15 @@ BOOKTODO: register tracking."
 ;;;;
 ;;;; Frontend
 ;;;;
-(defvar *sexp-path*)
-(defvar *compiled-procedure*)
+(defvar sexp-path)
+(defvar toplevelp)
 
 (defmacro with-noted-sexp-path (designator &body body)
-  `(let ((*sexp-path* (cons ,designator *sexp-path*)))
-     ,@body))
-
-(defmacro with-procedure-compilation ((procedure) &body body)
-  `(let ((*compiled-procedure* ,procedure))
+  `(let ((sexp-path (cons ,designator sexp-path)))
      ,@body))
 
 (defun expr-error (format-control &rest format-arguments)
-  (apply #'comp-error (format nil "~~@<In ~~S: ~A.~~:@>" format-control) *sexp-path* format-arguments))
+  (apply #'comp-error (format nil "~~@<In ~~S: ~A.~~:@>" format-control) sexp-path format-arguments))
 
 (defun compiler-note (format-control &rest format-arguments)
   (apply #'format t (format nil "~~@<; ~~@;note: ~A.~~:@>~%" format-control) format-arguments))
@@ -695,8 +702,76 @@ BOOKTODO: register tracking."
   (arch-addrtype a))
 
 ;;;;
-;;;; Frontend -> MIR
+;;;;  -> MIR
 ;;;;
+;;;; Function hierarchy goes unconventionally -- top-to-down.
+;;;;
+;;; a dispatcher/forwarder -- doesn't operate on anything
+(defun compile-toplevel (cctx expr &aux (toplevelp t))
+  (compiler-note "compiling toplevel: ~S" expr)
+  (if (atom expr)
+      (when-let ((sym (locate-sym (cctx-ggsymtab cctx) name)))
+        (when (eq :symbol-macro (syment-srctype sym))
+          (compile-toplevel cctx (funcall (symprop sym 'expander)))))
+      (let ((op (first expr)))
+        (with-noted-sexp-path op
+          (case op
+            (progn
+              (mapcar (curry #'compile-toplevel cctx) (rest expr)))
+            (define-symbol-macro
+             (destructuring-bind (name expansion) (rest expr)
+               (let ((preexisting-sym (locate-sym (cctx-ggsymtab cctx) name)))
+                 (when preexisting-sym
+                   (if (eq :symbol-macro (syment-srctype preexisting-sym))
+                       (note-redefinition name 'define-symbol-macro)
+                       (comp-error "In DEFINE-SYMBOL-MACRO: ~S is alredy defined as a ~A"
+                                   name (syment-srctype preexisting-sym))))
+                 (let ((sym (or preexisting-sym (insert-sym (cctx-ggsymtab cctx) name))))
+                   (setf (symprop sym 'expander)
+                         (compile nil `(lambda () ,expansion)))))))
+            (defmacro
+                (when (proc cctx (second expr) :if-does-not-exist :continue)
+                  (comp-error "~@<In DEFMACRO: ~S already defined as function.~:@>" op))
+                (destructuring-bind (name lambda-list &body body) (rest expr)
+                  (setf (macro compenv name) 
+                        (compile nil `(lambda ,lambda-list ,@body)))))
+            (defun
+                (when (macro cctx (second expr) :if-does-not-exist :continue)
+                  (expr-error "~@<In DEFUN: ~S already defined as macro.~:@>" op))
+                (destructuring-bind (name lambda-list &body body) (rest expr)
+                  (let ((toplevelp nil))
+                    (compile-defun cctx name lambda-list body))))
+            (t
+             (if-let ((macro (macro compenv op :if-does-not-exist :continue)))
+               (with-noted-sexp-path `(defmacro ,op)
+                 (compile-toplevel cctx (apply macro (rest expr))))
+               (compile-expr cctx nil nil (cctx-gsymtab cctx) nil nil expr))))))))
+
+;;; another dispatcher/forwarder -- doesn't operate on anything
+(defun compile-expr (cctx proc block symtab valuep tailp expr)
+  (when *comp-verbose*
+    (compiler-note "compiling ~S" expr))
+  (cond ((constant-p expr) (compile-constant     cctx proc block symtab valuep tailp expr))
+        ((symbolp expr)    (compile-symbol-ref   cctx proc block symtab valuep tailp expr))
+        ((atom expr)       (expr-error "atom ~S has unsupported type ~S" expr (type-of expr)))
+        (t
+         (with-noted-sexp-path (car expr)
+           (case (car expr)
+             (progn           (compile-progn           cctx proc block symtab valuep tailp (rest expr)))
+             (if              (compile-if              cctx proc block symtab valuep tailp (rest expr)))
+             (let             (compile-let             cctx proc block symtab valuep tailp (second expr) (cddr expr)))
+             (setq            (compile-setq            cctx proc block symtab valuep tailp (rest expr)))
+             (symbol-macrolet (compile-symbol-macrolet cctx proc block symtab valuep tailp (second expr) (cddr expr)))
+             #+nil (tagbody) #+nil (go)
+             #+nil (block)
+             #+nil (catch)   #+nil (throw)
+             #+nil (unwind-protect)
+             (t
+              (destructuring-bind (name &rest body) expr
+                (if-let ((macro (macro cctx name :if-does-not-exist :continue)))
+                  (compile-expr                        cctx proc block symtab valuep tailp (apply macro body))
+                  (compile-funcall                     cctx proc block symtab valuep tailp name body)))))))))
+
 (defun compile-defun (cctx name lambda-list body)
   (labels ((validate-lambda-list (list)
              (lret ((params (lambda-list-binds list)))
@@ -719,7 +794,7 @@ BOOKTODO: register tracking."
                      (expr-error "type declaration for unknown parameters ~S" martians))
                    (dolist (v vars)
                      (set-sym-srctype (proc-gsymtab proc) v type)))))
-    (with-noted-sexp-path `(defun ,name ,lambda-list ,@body)
+    (with-noted-sexp-path `(defun ,name ,lambda-list)
       ;; Make a temporary, incomplete function object for the purpose of recursion, with expression lacking proper code,
       ;; and type being set to t.
       (multiple-value-bind (docstring declarations body) (destructure-def-body body)
@@ -729,71 +804,47 @@ BOOKTODO: register tracking."
           (when (proc cctx name)
             (note-redefinition name 'defun))
           (setf (proc cctx name) proc)
-          (with-procedure-compilation (proc)
-            (with-slots (gsymtab) proc
-              (add-params-to-global-symtab proc parameters)
-              (let ((bb (make-basic-block proc nil nil))
-                    (type-decls (filter-type-declarations declarations)))
-                (append-to-block bb (make-label name))
-                (note-type-declarations proc type-decls)
-                (dolist (p parameters)
-                  (append-to-block bb (make-receive p (symentry-type (locate-sym gsymtab p)))))
-                (compile-progn cctx proc gsymtab (butlast body))
-                (compile-return cctx proc gsymtab (lastcar body))
-                (setf (proc-complete proc) t)))))))))
+          (with-slots (gsymtab) proc
+            (add-params-to-global-symtab proc parameters)
+            (let ((bb (make-basic-block proc nil nil))
+                  (type-decls (filter-type-declarations declarations)))
+              (append-to-block bb (make-label name))
+              (note-type-declarations proc type-decls)
+              (dolist (p parameters)
+                (append-to-block bb (make-receive p (symentry-type (locate-sym gsymtab p)))))
+              (compile-progn cctx proc gsymtab (butlast body))
+              (compile-return cctx proc gsymtab (lastcar body))
+              (setf (proc-complete proc) t))))))))
 
-(defun compile-constant (cctx proc expr valuep tailp)
+;;; leaf emitter, return value is expected to be grafted into another MIR inst 
+(defun compile-constant (cctx proc symtab block valuep tailp expr)
   (when valuep
-    (with-return-wrapped-if tailp
-      (make-instance 'expr :effect-free t :pure t :value-used t :env nil
-                     :type (comp-type-of expr) :branching nil :form expr
-                     :code
-                     (emit-constant (case expr
-                                      ((t) 1)
-                                      ((nil) 0)
-                                      (t expr)))))))
+    (make-constant-value :const expr)))
 
-(defun compile-expr (cctx proc symtab expr valuep tailp)
-  (when *comp-verbose*
-    (compiler-note "compiling ~S" expr))
-  (cond ((constant-p expr) (compile-constant     cctx proc        expr valuep tailp))
-        ((symbolp expr)    (compile-variable-ref cctx proc symtab expr valuep tailp))
-        ((atom expr)       (expr-error "atom ~S has unsupported type ~S" expr (type-of expr)))
-        (t
-         (case (car expr)
-           (progn (compile-progn cctx proc symtab (rest expr) valuep tailp))
-           (if    (compile-if    cctx proc symtab (rest expr) valuep tailp))
-           (let   (compile-let   cctx proc symtab (second expr) (cddr expr) valuep tailp))
-           #+nil (tagbody) #+nil (go)
-           #+nil (block)
-           #+nil (catch)   #+nil (throw)
-           #+nil (unwind-protect)
-           (t
-            (destructuring-bind (name &rest body) expr
-              (if-let ((macro (macro cctx name :if-does-not-exist :continue)))
-                (compile-expr    cctx proc symtab (apply macro body) valuep tailp)
-                (compile-funcall cctx proc symtab name body          valuep tailp))))))))
+;;; potential leaf emitter, return value might be grafted into another MIR inst 
+(defun compile-symbol-ref (cctx proc symtab block valuep tailp sym)
+  (if-let ((sym (or (locate-sym symtab sym)
+                    (locate-sym (cctx-ggsymtab cctx) sym))))
+    (if (eq :symbol-macro (syment-srctype sym))
+        (compile-expr cctx proc block symtab valuep tailp (funcall (symprop sym 'expander)))
+        (when valuep
+          (make-variable-reference :varname sym)))
+    (with-noted-sexp-path sym
+      (comp-error "undefined variable ~S" sym))))
 
-(defun compile-progn (cctx proc symtab exprs)
+(defun compile-progn (cctx proc block symtab valuep tailp exprs)
   (if exprs
-      (let* ((for-effect (remove nil (mapcar (rcurry #'compile-expr compenv lexenv nil nil) (butlast expr))))
-             (for-value (compile-expr (lastcar expr) compenv lexenv tailp valuep))
-             (effect-free (and (null for-effect) (expr-effect-free for-value)))
-             (pure (and effect-free (expr-pure for-value))))
-        (when (or valuep (not effect-free))
-          (make-instance 'expr :effect-free effect-free :pure pure :value-used valuep :env lexenv
-                         :type (expr-type for-value) :form `(progn ,@expr)
-                         :branching (cond ((find :funcall for-effect :key #'expr-branching) :funcall)
-                                          ((find :tail for-effect :key #'expr-branching) :non-tail)
-                                          ((find :non-tail for-effect :key #'expr-branching) :non-tail)
-                                          (for-value (expr-branching for-value)))
-                         :code
-                         (append for-effect
-                                 ;; for-value is NIL iff (and (not valuep) (expr-effect-free for-value-expr))
-                                 ;; which implies (not tail)
-                                 (when for-value
-                                   (list for-value))))))
-      (compile-constant nil valuep tailp)))
+      (progn
+        (mapcar (curry #'compile-expr cctx proc block symtab nil nil)
+                (butlast expr))
+        (compile-expr cctx proc block symtab tailp valuep (lastcar expr)))
+      (compile-constant cctx proc symtab valuep tailp nil)))
+
+(defun compile-symbol-macrolet (cctx proc symtab block valuep tailp bindings body)
+  )
+
+(defun compile-setq (cctx proc symtab block valuep tailp assignment-plist)
+  )
 
 ;;;
 ;;; IR1
