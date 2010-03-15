@@ -381,6 +381,7 @@
 (defstruct (symtab (:constructor %make-symtab (parent)))
   (parent nil :type (or null symtab))
   (syms (make-hash-table :test 'equal) :type hash-table)
+  (temporary-counter 0 :type fixnum)
   (childs nil :type list))
 
 (define-subcontainer locate-sym :container-slot syms :key-type string :type symentry :if-exists :continue :if-does-not-exist :continue
@@ -422,6 +423,34 @@ which, by convention, has depth zero."
                (rec (1+ depth) parent)
                depth)))
     (rec 0 symtab)))
+
+;;;
+;;; Non-Muchnick extensions
+(defun set-sym-srctype (cctx symtab sym srctype &aux
+                        (syment (locate-sym symtab sym)))
+  (setf (symentry-srctype syment) srctype
+        (symentry-type syment) (srctype-to-type cctx cctx srctype)))
+
+(defun extend-symtab (cctx symtab syms)
+  (dolist (sym syms)
+    (insert-sym symtab sym)
+    (set-sym-srctype cctx symtab sym t)))
+
+(defun note-type-declarations (cctx symtab decls)
+  (iter (for (type . vars) in decls)
+        (when-let ((martians (remove-if (curry #'locate-sym symtab) vars)))
+          (expr-error "type declaration for variables out of this scope ~S" martians))
+        (dolist (v vars)
+          (set-sym-srctype cctx symtab v type))))
+
+(defun handle-scope-extension (cctx symtab added-syms declarations)
+  (extend-symtab cctx symtab added-syms)
+  (note-type-declarations cctx symtab (filter-type-declarations declarations)))
+
+(defun allocate-tempvar (symtab)
+  (let ((name (format-symbol :keyword "T~D" (symtab-temporary-counter symtab))))
+    (incf (symtab-temporary-counter symtab))
+    (insert-sym symtab name)))
 
 ;;;;
 ;;;; Storage binding
@@ -748,6 +777,21 @@ BOOKTODO: register tracking."
                (compile-expr cctx nil nil (cctx-gsymtab cctx) nil nil expr))))))))
 
 ;;; another dispatcher/forwarder -- doesn't operate on anything
+;;; conventions for all dispatched-to handlers:
+;;; - the first return value is a variable reference (maybe a temporary), a constant,
+;;;   or nil, when 
+;;; - the second return value is the current basic block
+(defun the-mir-operand (maybe-mir-value)
+  (if (typep maybe-mir-value '(or variable-reference constant-value))
+      maybe-mir-value
+      (comp-error "internal compiler error while compiling ~S: ~
+                   expected either a constant or a variable reference, ~
+                   got a value of type ~A"
+                  sexp-path (type-of maybe-mir-value))))
+
+(defun filter-type-declarations (decls)
+  (mapcar #'rest (remove-if-not (feq 'type) decls :key #'car)))
+
 (defun compile-expr (cctx proc block symtab valuep tailp expr)
   (when *comp-verbose*
     (compiler-note "compiling ~S" expr))
@@ -762,15 +806,34 @@ BOOKTODO: register tracking."
              (let             (compile-let             cctx proc block symtab valuep tailp (second expr) (cddr expr)))
              (setq            (compile-setq            cctx proc block symtab valuep tailp (rest expr)))
              (symbol-macrolet (compile-symbol-macrolet cctx proc block symtab valuep tailp (second expr) (cddr expr)))
+             #+nil (function)
+             #+nil (funcall) #+nil (apply)
              #+nil (tagbody) #+nil (go)
              #+nil (block)
              #+nil (catch)   #+nil (throw)
              #+nil (unwind-protect)
+             #+nil (cons)
              (t
               (destructuring-bind (name &rest body) expr
                 (if-let ((macro (macro cctx name :if-does-not-exist :continue)))
                   (compile-expr                        cctx proc block symtab valuep tailp (apply macro body))
                   (compile-funcall                     cctx proc block symtab valuep tailp name body)))))))))
+
+;;; leaf emitter, return value is expected to be grafted into another MIR inst 
+(defun compile-constant (cctx proc block symtab valuep tailp expr)
+  (when valuep
+    (make-constant-value :const expr)))
+
+;;; potential leaf emitter, return value might be grafted into another MIR inst 
+(defun compile-symbol-ref (cctx proc block symtab valuep tailp sym)
+  (if-let ((syment (or (locate-sym symtab sym)
+                       (locate-sym (cctx-ggsymtab cctx) sym))))
+    (if (eq :symbol-macro (syment-srctype syment))
+        (compile-expr cctx proc block symtab valuep tailp (funcall (symprop syment 'expander)))
+        (when valuep
+          (make-variable-reference :varname sym)))
+    (with-noted-sexp-path sym
+      (comp-error "undefined variable ~S" sym))))
 
 (defun compile-defun (cctx name lambda-list body)
   (labels ((validate-lambda-list (list)
@@ -778,22 +841,7 @@ BOOKTODO: register tracking."
                (when-let ((dups (set-difference params (remove-duplicates params))))
                  (expr-error "duplicate entries in lambda list: ~S" dups))
                (when-let ((consts (remove-if-not #'const params)))
-                 (expr-error "reserved constant names in lambda list: ~S" consts))))
-           (set-sym-srctype (symtab sym srctype &aux
-                                  (syment (locate-sym symtab sym)))
-             (setf (symentry-srctype syment) srctype
-                   (symentry-type syment) (srctype-to-type cctx cctx srctype)))
-           (add-params-to-global-symtab (proc params)
-             (dolist (p params)
-               (set-sym-srctype (proc-gsymtab proc) p t)))
-           (filter-type-declarations (decls)
-             (mapcar #'rest (remove-if-not (feq 'type) decls :key #'car)))
-           (note-type-declarations (proc decls)
-             (iter (for (type . vars) in decls)
-                   (when-let ((martians (set-difference vars (proc-parameters proc))))
-                     (expr-error "type declaration for unknown parameters ~S" martians))
-                   (dolist (v vars)
-                     (set-sym-srctype (proc-gsymtab proc) v type)))))
+                 (expr-error "reserved constant names in lambda list: ~S" consts)))))
     (with-noted-sexp-path `(defun ,name ,lambda-list)
       ;; Make a temporary, incomplete function object for the purpose of recursion, with expression lacking proper code,
       ;; and type being set to t.
@@ -805,45 +853,97 @@ BOOKTODO: register tracking."
             (note-redefinition name 'defun))
           (setf (proc cctx name) proc)
           (with-slots (gsymtab) proc
-            (add-params-to-global-symtab proc parameters)
-            (let ((bb (make-basic-block proc nil nil))
-                  (type-decls (filter-type-declarations declarations)))
-              (append-to-block bb (make-label name))
-              (note-type-declarations proc type-decls)
+            (let ((block (make-basic-block proc nil nil)))
+              (append-to-block block (make-label name))
+              (handle-scope-extension cctx gsymtab parameters declarations)
               (dolist (p parameters)
-                (append-to-block bb (make-receive p (symentry-type (locate-sym gsymtab p)))))
-              (compile-progn cctx proc gsymtab (butlast body))
-              (compile-return cctx proc gsymtab (lastcar body))
+                (append-to-block block (make-receive p (symentry-type (locate-sym gsymtab p)))))
+              (compile-progn cctx proc block gsymtab nil nil (butlast body))
+              ;; the above can break the block, we need to account for that
+              (append-to-block block (make-return-value (the-mir-operand (compile-expr cctx proc block gsymtab t t (lastcar body)))))
               (setf (proc-complete proc) t))))))))
 
-;;; leaf emitter, return value is expected to be grafted into another MIR inst 
-(defun compile-constant (cctx proc symtab block valuep tailp expr)
-  (when valuep
-    (make-constant-value :const expr)))
-
-;;; potential leaf emitter, return value might be grafted into another MIR inst 
-(defun compile-symbol-ref (cctx proc symtab block valuep tailp sym)
-  (if-let ((sym (or (locate-sym symtab sym)
-                    (locate-sym (cctx-ggsymtab cctx) sym))))
-    (if (eq :symbol-macro (syment-srctype sym))
-        (compile-expr cctx proc block symtab valuep tailp (funcall (symprop sym 'expander)))
-        (when valuep
-          (make-variable-reference :varname sym)))
-    (with-noted-sexp-path sym
-      (comp-error "undefined variable ~S" sym))))
+(defun compile-funcall (cctx proc block symtab valuep tailp name args)
+  (let ((func (or (proc compenv fname :if-does-not-exist :continue)
+                  (primop fname :if-does-not-exist :continue))))
+    (unless func
+      (expr-error "reference to undefined function ~S" fname))
+    (unless (= (length args) (func-nargs func))
+      (expr-error "wrong argument count in call of ~S: got ~D, expected ~D"
+                  fname (length args) (func-nargs func)))
+    (with-noted-sexp-path `(funcall ,name)
+      (let ((arg-values (mapcar (curry #'compile-expr cctx proc block symtab t nil) args)))
+        (mapc #'the-mir-operand arg-values)
+        (if valuep
+            (lret ((tn (allocate-tempvar symtab)))
+              (append-to-block block (make-call-assignment tn proc arg-values)))
+            (append-to-block block (make-call proc arg-values)))))))
 
 (defun compile-progn (cctx proc block symtab valuep tailp exprs)
   (if exprs
       (progn
         (mapcar (curry #'compile-expr cctx proc block symtab nil nil)
-                (butlast expr))
-        (compile-expr cctx proc block symtab tailp valuep (lastcar expr)))
-      (compile-constant cctx proc symtab valuep tailp nil)))
+                (butlast exprs))
+        (compile-expr cctx proc block symtab valuep tailp (lastcar exprs)))
+      (compile-constant cctx proc block symtab valuep tailp nil)))
 
-(defun compile-symbol-macrolet (cctx proc symtab block valuep tailp bindings body)
-  )
+(defun compile-let (cctx proc block symtab valuep tailp bindings body)
+  (with-noted-sexp-path 'let
+    (let* ((syms (mapcar #'ensure-car bindings))
+           (binding-values (mapcar (curry #'compile-expr cctx proc block symtab t nil) (mapcar #'second bindings)))
+           (new-symtab (make-symtab symtab)))
+      (multiple-value-bind (declarations body) (destructure-binding-form-body body)
+        (handle-scope-extension cctx new-symtab syms declarations)
+        (iter (for sym in syms)
+              (for val in binding-values)
+              (append-to-block block (make-value-assignment sym val)))
+        (compile-progn cctx proc block new-symtab valuep tailp body)))))
 
-(defun compile-setq (cctx proc symtab block valuep tailp assignment-plist)
+(defun compile-if (cctx proc block symtab valuep tailp clauses)
+  (let ((n-args (length clauses)))
+    (when (or (< n-args 2)
+              (> n-args 3))
+      (expr-error "invalid number of elements in IF operator: between 2 and 3 expected")))
+  (destructuring-bind (condition then-clause &optional else-clause) clauses
+    (let* ((condition-code (compile-expr condition compenv lexenv t nil))
+           (then-code (compile-expr then-clause compenv lexenv valuep tailp))
+           (else-code (if else-clause
+                          (compile-expr else-clause compenv lexenv valuep tailp)
+                          (compile-constant nil valuep tailp))))
+      (with-noted-sexp-path 'if
+        (cond ((null condition) else-code)
+              ((constant-p condition) then-code)
+              ((equalp then-clause else-clause) (compile-progn `(,condition ,then-clause) compenv lexenv valuep tailp))
+              ((and (= 2 (length condition)) (eq (first condition) 'not))
+               (compile-if `(if ,(second condition) ,then-clause ,else-clause) compenv lexenv valuep tailp))
+              (t
+               (make-instance 'expr :effect-free effect-free :pure pure :value-used valuep :env lexenv
+                              :type (comp-simplify-logical-expression `(or ,(expr-type then-code) ,(expr-type else-code)))
+                              :form `(if ,condition ,then-clause ,@(when else-clause `(,else-clause)))
+                              :branching (if (find :funcall (list condition-code then-code else-code) :key #'expr-branching)
+                                             :funcall
+                                             :non-tail)
+                              :code
+                              (let ((else-label (gensym (concatenate 'string "IF-NOT")))
+                                    (end-label (gensym (concatenate 'string "IF-END"))))
+                                (append (list (make-instance 'expr :effect-free (expr-effect-free condition-code) :pure (expr-pure condition-code)
+                                                             :value-used t :env lexenv
+                                                             :type 'boolean :form condition
+                                                             :code
+                                                             (append (list condition-code)
+                                                                     (emit-jump-if-not else-label))))
+                                        (list then-code)
+                                        (unless tailp
+                                          (emit-jump end-label))
+                                        (emit-label else-label)
+                                        (list else-code)
+                                        (unless tailp
+                                          (emit-label end-label)))))))))))
+
+(defun compile-symbol-macrolet (cctx proc block symtab valuep tailp bindings body)
+  #+nil (let ((new-symtab (make-symtab )))))
+
+(defun compile-setq (cctx proc block symtab valuep tailp assignment-plist)
   )
 
 ;;;
@@ -898,235 +998,52 @@ BOOKTODO: register tracking."
                                         (go loop))
                                       (return-from machine-collector x-body))))))))))
 
-(defun comp-typep (x type)
-  (if (consp type)
-      (ecase (first type)
-        (and (not (null (every (curry #'comp-typep x) (rest type)))))
-        (or (not (null (some (curry #'comp-typep x) (rest type))))))
-      (ecase type
-        (boolean (member x '(t nil)))
-        (integer (typep x '(unsigned-byte 32)))
-        (nil nil)
-        ((t) t))))
+;; (defun comp-typep (x type)
+;;   (if (consp type)
+;;       (ecase (first type)
+;;         (and (not (null (every (curry #'comp-typep x) (rest type)))))
+;;         (or (not (null (some (curry #'comp-typep x) (rest type))))))
+;;       (ecase type
+;;         (boolean (member x '(t nil)))
+;;         (integer (typep x '(unsigned-byte 32)))
+;;         (nil nil)
+;;         ((t) t))))
 
-(defun comp-type-of (x)
-  (cond ((member x '(t nil)) 'boolean)
-        ((typep x '(unsigned-byte 32)) 'integer)
-        (t t)))
+;; (defun comp-type-of (x)
+;;   (cond ((member x '(t nil)) 'boolean)
+;;         ((typep x '(unsigned-byte 32)) 'integer)
+;;         (t t)))
 
-(defclass var ()
-  ((name :accessor var-name :initarg :name)))
-
-(defclass frame ()
-  ((dominator :accessor frame-dominator :initarg :dominator)
-   (vars :accessor frame-vars :initarg :vars)))
-
-(defclass expr-like ()
-  ((type :accessor expr-type :type (or symbol list) :initarg :type)
-   (effect-free :accessor expr-effect-free :type boolean :initarg :effect-free)
-   (pure :accessor expr-pure :type boolean :initarg :pure)
-   (branching :accessor expr-branching :type (or null (member :tail :non-tail :funcall)) :initarg :branching)))
-
-(defclass expr (expr-like)
-  ((value-used :accessor expr-value-used :type boolean :initarg :value-used)
-   (env :accessor expr-env :type (or null frame) :initarg :env)
-   (form :accessor expr-form :initarg :form)
-   (code :accessor expr-code :initarg :code)
-   (df-code :accessor expr-df-code :initform nil :documentation "DF nodes in CODE order (to facilitate side-effect ordering preservation).")))
-
-(define-print-object-method ((o expr) effect-free pure value-used type code)
-    "~@<#<EXPR ~;effect-free: ~S, pure: ~S, used: ~S, type: ~S~_~{~S~:@_~}~;>~:@>" effect-free pure value-used type code) ;
-
-(defclass tn (expr)
-  ()
-  (:documentation "An EXPR whose result requires attention of the register allocator."))
-
-(define-protocol-class dfnode ()
-  ((generator :accessor generator :initarg :generator))
-  (:documentation "Data flow node."))
-(define-print-object-method ((o dfnode) generator)
-    "~@<#<~;~A ~S~;>~:@>" (type-of o) generator)
-
-(define-protocol-class dfproducer (dfnode) ((consumers :accessor consumers :initform nil :initarg :consumers)))
-(define-protocol-class dfconsumer (dfnode) ((producers :accessor producers :initarg :producers)))
-(define-print-object-method ((o dfconsumer) generator producers)
-    "~@<#<~;~A ~S~_~{~S~:@_~}~;>~:@>" (type-of o) generator producers)
-
-(define-protocol-class dfcontinue (dfproducer dfconsumer) ())
-(define-protocol-class dfextremum (dfnode) ())
-
-(define-protocol-class dfstart (dfextremum dfproducer) ())
-(define-protocol-class dfend (dfextremum dfconsumer) ())
-
-(define-protocol-class dffanin (dfconsumer) ())
-(define-protocol-class dffanout (dfproducer) ())
-(define-protocol-class dfnotfan (dfnode) ())
-
-;; neither a producer, nor a consumer, a category of its own
-(defclass dfnop (dfnotfan) ())
-
-(defclass dfhead (dfstart dfnotfan) ())
-(defclass dftail (dfend dfnotfan) ())
-(defclass dfpipe (dfcontinue dfnotfan) ())
-
-(defclass dfstartfan (dfstart dffanout) ())
-(defclass dfendfan (dfend dffanin) ())
-(defclass dfuga (dfcontinue dffanout) ())
-(defclass dfagu (dfcontinue dffanin) ())
-
-(defclass dfhedge (dfcontinue dffanout dffanin) ())
-
-(defun compute-df-class (input output &aux (input (min 2 input)) (output (min 2 output)))
-  (cdr (find (cons input output)
-             '(((0 . 0) . dfnop)
-               ((0 . 1) . dfhead) ((1 . 0) . dftail) ((1 . 1) . dfpipe)
-               ((2 . 0) . dfendfan) ((0 . 2) . dfstartfan) ((2 . 1) . dfagu) ((1 . 2) . dfuga) ((2 . 2) . dfhedge))
-             :key #'car :test #'equal)))
-
-(defclass expr-var (var)
-  ((expr :accessor var-expr :type expr :initarg :expr)))
-
-(defmethod expr-type ((o expr-func)) (expr-type (func-expr o)))
-(defmethod expr-effect-free ((o expr-func)) (expr-effect-free (func-expr o)))
-(defmethod expr-pure ((o expr-func)) (expr-pure (func-expr o)))
-
-(define-print-object-method ((o func) name nargs leafp)
-    "~@<#<FUNC ~;~S, ~S args, leafp: ~S, type: ~S, effect-free: ~S>~:@>" name nargs leafp (expr-type o) (expr-effect-free o))
-
-(defparameter *primops* (make-hash-table :test 'eq))
-
-(define-root-container *primops* primop :if-exists :error)
-
-(define-subcontainer func :container-slot functions :type expr-func :if-exists :error)
-(define-subcontainer macro :container-slot macros :type function :if-exists :error)
-
-(defun frame-boundp (name frame)
-  (find name (frame-vars frame) :key #'var-name))
-
-(defun env-boundp (name env)
-  (and env
-       (or (frame-boundp name env)
-           (env-boundp name (frame-dominator env)))))
-
-(defun make-frame-from-vars (vars dominator)
-  (make-instance 'frame :dominator dominator :vars vars))
-
-(defun make-frame-from-var-names (var-names dominator)
-  (make-frame-from-vars (mapcar (curry #'make-instance 'var :name) var-names) dominator))
-
-;;;
-;;; IR2
-;;;
-(defstruct vop
-  nargs
-  nvalues
-  code)
-
-(defmethod print-object ((o vop) stream)
-  (print-unreadable-object (o stream)
-    (format stream "VOP ~S" (vop-code o))))
-
-(defun emit-label (name)
-  (list name))
-
-(defun emit-constant (value)
-  (list (make-vop :nargs 0 :nvalues 1 :code `(const ,value))))
-
-(defun emit-lvar-ref (lvar)
-  (list (make-vop :nargs 0 :nvalues 1 :code `(lvar-ref ,lvar))))
-
-(defun emit-lvar-set (lvar)
-  (list (make-vop :nargs 1 :nvalues 0 :code `(lvar-set ,lvar))))
-
-(defun emit-funarg-set (i)
-  (list (make-vop :nargs 1 :nvalues 0 :code `(funarg-set ,i))))
-
-(defun emit-save-continuation (label)
-  (list (make-vop :nargs 0 :nvalues 1 :code `(save-continuation ,label))))
-
-(defun emit-jump (label)
-  (list (make-vop :nargs 0 :nvalues 0 :code `(jump ,label))))
-
-(defun emit-jump-if (label)
-  (list (make-vop :nargs 1 :nvalues 0 :code `(jump-if ,label))))
-
-(defun emit-jump-if-not (label)
-  (list (make-vop :nargs 1 :nvalues 0 :code `(jump-if-not ,label))))
-
-(defun emit-return ()
-  (list (make-vop :nargs 1 :nvalues 0 :code `(return))))
-
-(defun emit-primitive (name nargs nvalues &rest primitive-args)
-  (list (make-vop :nargs nargs :nvalues nvalues :code `(primitive ,name ,@primitive-args))))
-
-;;;
-;;; The megaquestion is whether PRIMOP's expr slot is warranted.
-;;;
-(defun instantiate-simple-primop (primop valuep args arg-exprs &aux (name (func-name primop)))
-  (unless (= (length args) (func-nargs primop))
-    (error "~@<~S was provided the wrong amount of values: ~D, expected ~D.~:@>" primop (length args) (func-nargs primop)))
-  (make-instance 'expr :effect-free (expr-effect-free primop) :pure (expr-pure primop) :value-used valuep :env nil
-                 :type (expr-type primop) :branching (expr-branching primop) :form `(,name ,@args) 
-                 :code (append arg-exprs
-                               (emit-primitive name (func-nargs primop) (func-nvalues primop)))))
-
-(defun ensure-primitive (name nargs nvalues type valuep effect-free pure branching &key folder-fn (instantiator-fn #'instantiate-simple-primop)
-                         (papplicable-p (constantly nil)) papplicator-fn)
-  (setf (primop name) (make-instance 'primop :name name :nargs nargs :nvalues nvalues :leafp t :type type :valuep valuep :effect-free effect-free :pure pure
-                                     :branching branching
-                                     :instantiator instantiator-fn
-                                     :folder folder-fn
-                                     :papplicable-p papplicable-p :papplicator papplicator-fn)))
-
-(defmacro defprimitive (name nargs nvalues type valuep effect-free pure branching &rest args)
-  (let ((instantiator (rest (find :instantiator args :key #'car)))
-        (folder (rest (find :folder args :key #'car)))
-        (papplicable-p (rest (find :papplicable-p args :key #'car)))
-        (papplicator (rest (find :papplicator args :key #'car))))
-   `(ensure-primitive ',name ,nargs ,nvalues ',type ,valuep ,effect-free ,pure ,branching
-                      ,@(when instantiator
-                              `(:instantiator-fn (lambda ,(first instantiator) ,@(rest instantiator))))
-                      ,@(when folder
-                              `(:folder-fn (lambda ,(first folder) ,@(rest folder))))
-                      ,@(when papplicable-p
-                              (unless papplicator
-                                (comp-error "~@<In DEFPRIMITIVE ~S: PAPPLICABLE-P specified without PAPPLICATOR.~:@>" name))
-                              `(:papplicable-p (lambda ,(first papplicable-p) ,@(rest papplicable-p))))
-                      ,@(when papplicator
-                              (unless papplicable-p
-                                (comp-error "~@<In DEFPRIMITIVE ~S: PAPPLICATOR specified without PAPPLICABLE-P.~:@>" name))
-                              `(:papplicator-fn (lambda ,(first papplicator) ,@(rest papplicator)))))))
-
-(defprimitive +              2 1 integer t   t   t   nil
-  (:folder (arg-exprs tailp)
-    (compile-constant (apply #'+ (mapcar #'expr-form arg-exprs)) t tailp)))
-(defprimitive -              2 1 integer t   t   t   nil)
-(defprimitive logior         2 1 integer t   t   t   nil)
-(defprimitive logand         2 1 integer t   t   t   nil)
-(defprimitive logxor         2 1 integer t   t   t   nil)
-(defprimitive ash            2 1 integer t   t   t   nil
-  (:folder (arg-exprs tailp)
-    (compile-constant (apply #'ash (mapcar #'expr-form arg-exprs)) t tailp))
-  (:papplicable-p (arg-exprs &aux (shift (expr-form (second arg-exprs))))
-    (and (integerp shift) (zerop shift)))
-  (:papplicator (arg-exprs)
-    (first arg-exprs)))
-(defprimitive lognot         1 1 integer t   t   t   nil)
-(defprimitive =              2 1 boolean t   t   t   nil)
-(defprimitive /=             2 1 boolean t   t   t   nil)
-(defprimitive >=             2 1 boolean t   t   t   nil)
-(defprimitive <=             2 1 boolean t   t   t   nil)
-(defprimitive >              2 1 boolean t   t   t   nil)
-(defprimitive <              2 1 boolean t   t   t   nil)
-(defprimitive mem-ref        2 1 integer t   t   nil nil)
-(defprimitive mem-set        3 0 nil     nil nil nil nil)
-(defprimitive mem-ref-impure 2 1 integer t   nil nil nil)
-(defprimitive funarg-ref     2 1 t       t   t   t   nil
-  (:instantiator (primop valuep args arg-exprs &aux (type (second args)))
-    (declare (ignore arg-exprs))
-    (make-instance 'expr :effect-free t :pure t :value-used valuep :env nil
-                   :type type :branching nil :form `(,(func-name primop) ,@args)
-                   :code (apply #'emit-primitive 'funarg-ref 0 1 args))))
+;; (defprimitive +              2 1 integer t   t   t   nil
+;;   (:folder (arg-exprs tailp)
+;;     (compile-constant (apply #'+ (mapcar #'expr-form arg-exprs)) t tailp)))
+;; (defprimitive -              2 1 integer t   t   t   nil)
+;; (defprimitive logior         2 1 integer t   t   t   nil)
+;; (defprimitive logand         2 1 integer t   t   t   nil)
+;; (defprimitive logxor         2 1 integer t   t   t   nil)
+;; (defprimitive ash            2 1 integer t   t   t   nil
+;;   (:folder (arg-exprs tailp)
+;;     (compile-constant (apply #'ash (mapcar #'expr-form arg-exprs)) t tailp))
+;;   (:papplicable-p (arg-exprs &aux (shift (expr-form (second arg-exprs))))
+;;     (and (integerp shift) (zerop shift)))
+;;   (:papplicator (arg-exprs)
+;;     (first arg-exprs)))
+;; (defprimitive lognot         1 1 integer t   t   t   nil)
+;; (defprimitive =              2 1 boolean t   t   t   nil)
+;; (defprimitive /=             2 1 boolean t   t   t   nil)
+;; (defprimitive >=             2 1 boolean t   t   t   nil)
+;; (defprimitive <=             2 1 boolean t   t   t   nil)
+;; (defprimitive >              2 1 boolean t   t   t   nil)
+;; (defprimitive <              2 1 boolean t   t   t   nil)
+;; (defprimitive mem-ref        2 1 integer t   t   nil nil)
+;; (defprimitive mem-set        3 0 nil     nil nil nil nil)
+;; (defprimitive mem-ref-impure 2 1 integer t   nil nil nil)
+;; (defprimitive funarg-ref     2 1 t       t   t   t   nil
+;;   (:instantiator (primop valuep args arg-exprs &aux (type (second args)))
+;;     (declare (ignore arg-exprs))
+;;     (make-instance 'expr :effect-free t :pure t :value-used valuep :env nil
+;;                    :type type :branching nil :form `(,(func-name primop) ,@args)
+;;                    :code (apply #'emit-primitive 'funarg-ref 0 1 args))))
 
 ;;;
 ;;; Actual compilation
@@ -1145,266 +1062,15 @@ BOOKTODO: register tracking."
 ;;;   - a shift of label generation into a later point,
 ;;;   - an increase of branch target granularity to EXPRs.
 ;;;
-(defun constant-p (expr)
-  (or (eq expr 't)
-      (eq expr 'nil)
-      (integerp expr)))
 
-(defun degrade-tail-branching (x)
-  (if (eq x :tail)
-      :non-tail
-      x))
-
-(defun maybe-wrap-with-return (wrap-p expr)
-  (if wrap-p
-      (make-instance 'expr :effect-free (expr-effect-free expr) :pure (expr-pure expr) :value-used t :env nil
-                     :type (expr-type expr) :branching (degrade-tail-branching (expr-branching expr)) :form `(return ,(expr-code expr))
-                     :code
-                     (append (list expr)
-                             (emit-return)))
-      expr))
-
-(defmacro with-return-wrapped-if (wrap-p &body expr)
-  `(maybe-wrap-with-return ,wrap-p ,@expr))
-
-(defun compile-variable-ref (var lexenv valuep tailp)
-  (with-noted-sexp-path var
-    (unless (env-boundp var lexenv)
-      (expr-error "~S not bound" var))
-    (when valuep
-      (with-return-wrapped-if tailp
-        (make-instance 'expr :effect-free t :pure nil :value-used t :env lexenv
-                       :type t :branching nil :form var
-                       :code
-                       (emit-lvar-ref var))))))
-
-(defun compile-variable-set (var value compenv lexenv valuep tailp)
-  (with-noted-sexp-path `(setf ,var)
-    (unless (env-boundp var lexenv)
-      (expr-error "~S not bound" var))
-    (with-return-wrapped-if tailp
-      (let ((value-expr (if (typep value 'expr)
-                            value
-                            (compile-expr value compenv lexenv t nil))))
-        (make-instance 'expr :effect-free nil :pure nil :value-used valuep :env lexenv
-                       :type (expr-type value-expr) :branching nil :form `(setf ,var ,(expr-form value-expr))
-                       :code
-                       (append (list value-expr)
-                               (emit-lvar-set var)))))))
-
-(defvar *compiled-function*)
-
-(defun compile-funcall (fname args compenv lexenv valuep tailp)
-  (let ((func (or (func compenv fname :if-does-not-exist :continue)
-                  (primop fname :if-does-not-exist :continue))))
-    (unless func
-      (expr-error "reference to undefined function ~S" fname))
-    (unless (= (length args) (func-nargs func))
-      (expr-error "wrong argument count in call of ~S: got ~D, expected ~D"
-                  fname (length args) (func-nargs func)))
-    (with-noted-sexp-path `(funcall ,fname)
-      (let* ((args-code (mapcar (rcurry #'compile-expr compenv lexenv t nil) args))
-             (effect-free (every #'expr-effect-free (cons func args-code)))
-             (pure (and effect-free (expr-pure func) (every #'expr-pure args-code))))
-        (when (or valuep (not effect-free))
-          (cond ((typep func 'primop)
-                 (cond ((and pure (primop-folder func))
-                        (funcall (primop-folder func) args-code tailp))
-                       ((funcall (primop-papplicable-p func) args-code)
-                        (with-return-wrapped-if tailp
-                          (funcall (primop-papplicator func) args-code)))
-                       (t
-                        (with-return-wrapped-if tailp
-                          (funcall (primop-instantiator func) func valuep args args-code)))))
-                (t
-                 (when (and (boundp '*compiled-function*)
-                            (func-leafp *compiled-function*))
-                   (compiler-note "degrading ~S to non-leaf" *compiled-function*)
-                   (setf (func-leafp *compiled-function*) nil))
-                 (make-instance 'expr :effect-free effect-free :pure pure :value-used valuep :env lexenv
-                                :type (if (and (boundp '*compiled-function*)
-                                               (eq func *compiled-function*))
-                                          nil
-                                          (expr-type func))
-                                :branching :funcall
-                                :form `(,fname ,@args)
-                                :code (let ((ret-label (gensym (concatenate 'string "BACK-FROM-" (symbol-name fname)))))
-                                        (append (iter (for arg-code in args-code)
-                                                      (for i from 0)
-                                                      (collect (make-instance 'expr :effect-free nil :pure nil :value-used t :env lexenv
-                                                                              :type (expr-type arg-code) :form `(funarg-set ,i ,(expr-form arg-code))
-                                                                              :code
-                                                                              (append (list arg-code)
-                                                                                      (emit-funarg-set i)))))
-                                                (unless tailp
-                                                  (emit-save-continuation ret-label))
-                                                (emit-jump fname)
-                                                (unless tailp
-                                                  (emit-label ret-label))))))))))))
-
-;;;
-;;; Non-leaf expressions
-;;;
-;;; For now, we can't rely much on VAR-EXPR.
-(defun compile-let (bindings body compenv lexenv valuep tailp)
-  (with-noted-sexp-path 'let
-    (let* ((binding-value-code (mapcar (rcurry #'compile-expr compenv lexenv t nil) (mapcar #'second bindings)))
-           (vars (iter (for (name . nil) in bindings)
-                       (for expr in binding-value-code)
-                       (collect (make-instance 'expr-var :name name :expr expr))))
-           (new-lexenv (make-frame-from-vars vars lexenv))
-           (body-code (compile-progn body compenv new-lexenv valuep tailp))
-           (effect-free (every #'expr-effect-free (cons body-code binding-value-code)))
-           (pure (and effect-free (every #'expr-pure (cons body-code binding-value-code)))))
-      (when (or valuep (not effect-free))
-        (make-instance 'expr :effect-free effect-free :pure pure :value-used valuep :env lexenv
-                       :type (expr-type body-code) :form `(let ,bindings ,@body)
-                       :branching (cond ((find :funcall binding-value-code :key #'expr-branching) :funcall)
-                                        ((find :tail binding-value-code :key #'expr-branching) :non-tail)
-                                        ((find :non-tail binding-value-code :key #'expr-branching) :non-tail)
-                                        (t (expr-branching body-code)))
-                       :code
-                       (append (iter (for var in vars)
-                                     (collect (compile-variable-set (var-name var) (var-expr var) compenv new-lexenv nil nil)))
-                               (list body-code)))))))
-
-;;;
-;;;   At this point we're past the fist pass, namely conversion of code
-;;; into soup of PRIMOPs, carrying concrete details of:
-;;;   - amount of required inputs and outputs, and
-;;;   - expansion on specific architecture;
-;;; and EXPR tree nodes, qualifying subtrees with:
-;;;   - effect-fulness or, perhapes even purity, and
-;;;   - type information.
-;;;
-;;;   Important invariants, simplifying (but, probably, not precluding)
-;;; interpretation of the tree, are:
-;;;   - dependencies are EXPR-local, i.e. EXPRs cannot have dependencies.
-;;;   - whenever a VOP has dependencies, it must be the last one in its
-;;; parent's EXPR CODE sequence;
-;;;   - at the point of that particular VOP's occurence the amount of
-;;; outstanding DF sticks must be equal to the amount of VOP's dependencies.
-;;;
-;;;   As it stands, EXPR's CODE sequences fall into two types:
-;;;   - those ending with a producing VOP or EXPR, described above.
-;;; Such entries will mark their parent EXPR as a DF producer.
-;;;   - EXPRs which always have a zero DF producer count in their CODE
-;;; sequence.
-;;;
-(defun build-data-flow-graph (parent soup consumer acc-producers)
-  (etypecase soup
-    (vop
-     (unless (or consumer (zerop (vop-nargs soup)))
-       (error "~@<Starved VOP ~S in ~S: requires ~D arguments, but wasn't marked as consumer.~:@>" soup parent (vop-nargs soup)))
-     (when (and consumer (not (= (vop-nargs soup) (length acc-producers))))
-       (error "~@<At expression ~S: producer count ~D, but VOP ~S expected ~D.~:@>" parent (length acc-producers) soup (vop-nargs soup)))
-     (let ((dfnode (make-instance (compute-df-class (vop-nargs soup) (vop-nvalues soup))
-                                  :generator soup
-                                  :producers (when consumer acc-producers))))
-       (when consumer
-         (format t "~@<Consuming ~S.~:@>~%" acc-producers)
-         (dolist (producer acc-producers)
-           (push dfnode (consumers producer))))
-       (format t "~@<VOP ~S prepending ~S to producers.~:@>~%" soup (when (typep dfnode 'dfproducer)
-                                                                  (make-list (vop-nvalues soup) :initial-element dfnode)))
-       (values (append (when (typep dfnode 'dfproducer)
-                         (make-list (vop-nvalues soup) :initial-element dfnode))
-                       (unless consumer acc-producers))
-               dfnode)))
-    (expr
-     (when consumer
-       (error "~@<EXPR ~S was marked as consumer.~:@>" soup))
-     ;; Here's the point where we need CFA to perform separate iterations
-     ;; on basic block, so as not to conflate BBs producers.
-     ;; But if we localize passing to subnodes in branchy-branchy EXPRs,
-     ;; shouldn't it justwork?
-     (values
-      (let (producers)
-        (format t "~@<Processing ~S.~:@>~%" soup)
-        (setf (expr-df-code soup)
-              (iter (for (subsoup . rest-code) on (expr-code soup))
-                    (format t "~@<Producers: ~S before sub ~S.~:@>~%" producers subsoup)
-                    (multiple-value-bind (new-producers node)
-                        (build-data-flow-graph soup subsoup (and (endp rest-code) (typep subsoup 'vop) (plusp (vop-nargs subsoup))) producers)
-                      (etypecase node 
-                        (dfnode (collect node))
-                        (expr (appending (expr-df-code node))))
-                      (setf producers new-producers))))
-        (format t "~@<Prepending ~S to producers.~:@>~%" producers)
-        (append producers acc-producers))
-      soup))))
-
-(defun compile-if (clauses compenv lexenv valuep tailp)
-  (let ((n-args (length clauses)))
-    (when (or (< n-args 2)
-              (> n-args 3))
-      (expr-error "invalid number of elements in IF operator: between 2 and 3 expected")))
-  (destructuring-bind (condition then-clause &optional else-clause) clauses
-    (let* ((condition-code (compile-expr condition compenv lexenv t nil))
-           (then-code (compile-expr then-clause compenv lexenv valuep tailp))
-           (else-code (if else-clause
-                          (compile-expr else-clause compenv lexenv valuep tailp)
-                          (compile-constant nil valuep tailp)))
-           (effect-free (every #'expr-effect-free (list condition-code then-code else-code)))
-           (pure (and effect-free (every #'expr-pure (list condition-code then-code else-code)))))
-      (when (or valuep effect-free)
-        (with-noted-sexp-path 'if
-          (cond ((null condition) else-code)
-                ((constant-p condition) then-code)
-                ((equalp then-clause else-clause) (compile-progn `(,condition ,then-clause) compenv lexenv valuep tailp))
-                ((and (= 2 (length condition)) (eq (first condition) 'not))
-                 (compile-if `(if ,(second condition) ,then-clause ,else-clause) compenv lexenv valuep tailp))
-                (t
-                 (make-instance 'expr :effect-free effect-free :pure pure :value-used valuep :env lexenv
-                                :type (comp-simplify-logical-expression `(or ,(expr-type then-code) ,(expr-type else-code)))
-                                :form `(if ,condition ,then-clause ,@(when else-clause `(,else-clause)))
-                                :branching (if (find :funcall (list condition-code then-code else-code) :key #'expr-branching)
-                                               :funcall
-                                               :non-tail)
-                                :code
-                                (let ((else-label (gensym (concatenate 'string "IF-NOT")))
-                                      (end-label (gensym (concatenate 'string "IF-END"))))
-                                  (append (list (make-instance 'expr :effect-free (expr-effect-free condition-code) :pure (expr-pure condition-code)
-                                                               :value-used t :env lexenv
-                                                               :type 'boolean :form condition
-                                                               :code
-                                                               (append (list condition-code)
-                                                                       (emit-jump-if-not else-label))))
-                                          (list then-code)
-                                          (unless tailp
-                                            (emit-jump end-label))
-                                          (emit-label else-label)
-                                          (list else-code)
-                                          (unless tailp
-                                            (emit-label end-label))))))))))))
-
-(defun compile-toplevel (expr compenv)
-  (compiler-note "compiling toplevel: ~S" expr)
-  (when (consp expr)
-    (let ((op (first expr)))
-      (case op
-        (progn
-          (with-noted-sexp-path 'progn
-            (iter (for sub-toplevel in (rest expr))
-                  (for expr = (compile-toplevel sub-toplevel compenv))
-                  (when (and expr (not (expr-effect-free expr)))
-                    (collect expr)))))
-        (defmacro
-            (when (func compenv op :if-does-not-exist :continue)
-              (comp-error "~@<In DEFMACRO: ~S already defined as function.~:@>" op))
-            (destructuring-bind (name lambda-list &body body) (rest expr)
-              (setf (macro compenv name) (compile nil `(lambda ,lambda-list ,@body))))
-          nil)
-        (defun
-            (when (macro compenv op :if-does-not-exist :continue)
-              (expr-error "~@<In DEFUN: ~S already defined as macro.~:@>" op))
-            (destructuring-bind (name lambda-list &body body) (rest expr)
-              (compile-defun name lambda-list body compenv)))
-        (t
-         (if-let ((macro (macro compenv op :if-does-not-exist :continue)))
-           (with-noted-sexp-path `(defmacro ,op)
-             (compile-toplevel (apply macro (rest expr)) compenv))
-           (compile-expr expr compenv nil nil nil)))))))
+;; (defun maybe-wrap-with-return (wrap-p expr)
+;;   (if wrap-p
+;;       (make-instance 'expr :effect-free (expr-effect-free expr) :pure (expr-pure expr) :value-used t :env nil
+;;                      :type (expr-type expr) :branching (degrade-tail-branching (expr-branching expr)) :form `(return ,(expr-code expr))
+;;                      :code
+;;                      (append (list expr)
+;;                              (emit-return)))
+;;       expr))
 
 (defparameter *test-code* `((defun flash-write-abs (absolute-addr value)
                               (mem-set absolute-addr 0
