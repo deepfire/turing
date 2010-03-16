@@ -519,7 +519,6 @@ assigns a displacement and the frame pointer as the base register."
   (documentation)
   (body)
   (leafp)
-  (complete)
   ;; Muchnik.
   (static-link-offset)
   (gsymtab (make-symtab))
@@ -640,7 +639,7 @@ associate the register with a symbol, unlike ALLOC-REG.")
       (let ((scratch-reg (if storep
                              (alloc-reg-anon cctx nil 4) ; can't reuse source reg as scratch
                              reg)))
-        (dotimes (i (cctx-depth cctx))
+        (dotimes (i (proc-depth cctx))
           (emit-address-load cctx scratch-reg base-reg (proc-static-link-offset proc))
           (emit-register-move cctx base-reg scratch-reg)
           ;; XXXBOOK: wtf was supposed to be this line?  Page 63.
@@ -728,59 +727,13 @@ BOOKTODO: register tracking."
 (defclass lisp-context (lisp-language context) ())
 
 (defmethod srctype-to-type (architecture (l lisp-language) srctype)
-  (arch-addrtype a))
+  (arch-addrtype architecture))
 
 ;;;;
 ;;;;  -> MIR
 ;;;;
 ;;;; Function hierarchy goes unconventionally -- top-to-down.
 ;;;;
-;;; a dispatcher/forwarder -- doesn't operate on anything
-(defun compile-toplevel (cctx expr &aux (toplevelp t))
-  (compiler-note "compiling toplevel: ~S" expr)
-  (if (atom expr)
-      (when-let ((sym (locate-sym (cctx-ggsymtab cctx) name)))
-        (when (eq :symbol-macro (syment-srctype sym))
-          (compile-toplevel cctx (funcall (symprop sym 'expander)))))
-      (let ((op (first expr)))
-        (with-noted-sexp-path op
-          (case op
-            (progn
-              (mapcar (curry #'compile-toplevel cctx) (rest expr)))
-            (define-symbol-macro
-             (destructuring-bind (name expansion) (rest expr)
-               (let ((preexisting-sym (locate-sym (cctx-ggsymtab cctx) name)))
-                 (when preexisting-sym
-                   (if (eq :symbol-macro (syment-srctype preexisting-sym))
-                       (note-redefinition name 'define-symbol-macro)
-                       (comp-error "In DEFINE-SYMBOL-MACRO: ~S is alredy defined as a ~A"
-                                   name (syment-srctype preexisting-sym))))
-                 (let ((sym (or preexisting-sym (insert-sym (cctx-ggsymtab cctx) name))))
-                   (setf (symprop sym 'expander)
-                         (compile nil `(lambda () ,expansion)))))))
-            (defmacro
-                (when (proc cctx (second expr) :if-does-not-exist :continue)
-                  (comp-error "~@<In DEFMACRO: ~S already defined as function.~:@>" op))
-                (destructuring-bind (name lambda-list &body body) (rest expr)
-                  (setf (macro compenv name) 
-                        (compile nil `(lambda ,lambda-list ,@body)))))
-            (defun
-                (when (macro cctx (second expr) :if-does-not-exist :continue)
-                  (expr-error "~@<In DEFUN: ~S already defined as macro.~:@>" op))
-                (destructuring-bind (name lambda-list &body body) (rest expr)
-                  (let ((toplevelp nil))
-                    (compile-defun cctx name lambda-list body))))
-            (t
-             (if-let ((macro (macro compenv op :if-does-not-exist :continue)))
-               (with-noted-sexp-path `(defmacro ,op)
-                 (compile-toplevel cctx (apply macro (rest expr))))
-               (compile-expr cctx nil nil (cctx-gsymtab cctx) nil nil expr))))))))
-
-;;; another dispatcher/forwarder -- doesn't operate on anything
-;;; conventions for all dispatched-to handlers:
-;;; - the first return value is a variable reference (maybe a temporary), a constant,
-;;;   or nil, when 
-;;; - the second return value is the current basic block
 (defun the-mir-operand (maybe-mir-value)
   (if (typep maybe-mir-value '(or variable-reference constant-value))
       maybe-mir-value
@@ -792,23 +745,68 @@ BOOKTODO: register tracking."
 (defun filter-type-declarations (decls)
   (mapcar #'rest (remove-if-not (feq 'type) decls :key #'car)))
 
+;;; a dispatcher/forwarder -- doesn't operate on anything
+(defun compile-toplevel (cctx expr &aux (toplevelp t))
+  (compiler-note "compiling toplevel: ~S" expr)
+  (if (atom expr)
+      (when-let ((sym (locate-sym (cctx-ggsymtab cctx) expr)))
+        (when (eq :symbol-macro (symentry-srctype sym))
+          (compile-toplevel cctx (funcall (symprop sym 'expander)))))
+      (let ((op (first expr)))
+        (with-noted-sexp-path op
+          (case op
+            (progn                                                                                                       ; done
+              (mapcar (curry #'compile-toplevel cctx) (rest expr)))
+            (define-symbol-macro                                                                                         ; done
+             (destructuring-bind (name expansion) expr
+               (compile-define-symbol-macro cctx name expansion)))
+            (defmacro                                                                                                    ; done
+                (when (proc cctx (second expr) :if-does-not-exist :continue)
+                  (comp-error "~@<In DEFMACRO: ~S already defined as function.~:@>" op))
+                (destructuring-bind (name lambda-list &body body) (rest expr)
+                  (setf (macro cctx name) 
+                        (compile nil `(lambda ,lambda-list ,@body)))))
+            (defun                                                                                                       ; done (?)
+                (when (macro cctx (second expr) :if-does-not-exist :continue)
+                  (expr-error "~@<In DEFUN: ~S already defined as macro.~:@>" op))
+                (destructuring-bind (name lambda-list &body body) (rest expr)
+                  (let ((toplevelp nil))
+                    (compile-defun cctx name lambda-list body))))
+            (t                                                                                                           ; COMPILE-EXPR not NIL-safe wrt block and symtab
+             (if-let ((macro (macro cctx op :if-does-not-exist :continue)))
+               (with-noted-sexp-path `(defmacro ,op)
+                 (compile-toplevel cctx (apply macro (rest expr))))
+               (compile-expr cctx nil nil (cctx-ggsymtab cctx) nil nil expr))))))))
+
+;;; another dispatcher/forwarder -- doesn't emit anything by itself
+;;; conventions for all dispatched-to handlers:
+;;; - valuep, when non-NIL indicates that the expression is compiled not only for
+;;;   effect, and that some kind of value passing is due.  In which case it is either T,
+;;;   which indicates that the means of value passing are to be provided by the handler --
+;;;   either as a CONSTANT-VALUE or as VARIABLE-REFERENCE MIR instruction; or it must be a
+;;;   VARIABLE-REFERENCE itself, indicating that an outer context facilitates value passing.
+;;; - the first return value is a variable reference (maybe a temporary), a constant,
+;;;   or nil, when VALUEP was provided as NIL.
+;;; - the second return value is the current basic block, after compiling the expression.
 (defun compile-expr (cctx proc block symtab valuep tailp expr)
   (when *comp-verbose*
     (compiler-note "compiling ~S" expr))
-  (cond ((constant-p expr) (compile-constant     cctx proc block symtab valuep tailp expr))
-        ((symbolp expr)    (compile-symbol-ref   cctx proc block symtab valuep tailp expr))
+  (cond ((constant-p expr) (compile-constant           cctx proc block symtab valuep tailp expr))                        ; done
+        ((symbolp expr)    (compile-symbol-ref         cctx proc block symtab valuep tailp expr))                        ; done
         ((atom expr)       (expr-error "atom ~S has unsupported type ~S" expr (type-of expr)))
         (t
          (with-noted-sexp-path (car expr)
            (case (car expr)
-             (progn           (compile-progn           cctx proc block symtab valuep tailp (rest expr)))
-             (if              (compile-if              cctx proc block symtab valuep tailp (rest expr)))
-             (let             (compile-let             cctx proc block symtab valuep tailp (second expr) (cddr expr)))
-             (setq            (compile-setq            cctx proc block symtab valuep tailp (rest expr)))
-             (symbol-macrolet (compile-symbol-macrolet cctx proc block symtab valuep tailp (second expr) (cddr expr)))
+             (progn           (compile-progn           cctx proc block symtab valuep tailp (rest expr)))                 ; done
+             (if              (compile-if              cctx proc block symtab valuep tailp (rest expr)))                 ; MIR matching...
+             (let             (compile-let             cctx proc block symtab valuep tailp (second expr) (cddr expr)))   ; done
+             (setq            (compile-setq            cctx proc block symtab valuep tailp (rest expr)))                 ; done
+             (symbol-macrolet (compile-symbol-macrolet cctx proc block symtab valuep tailp (second expr) (cddr expr)))   ; done
              #+nil (function)
              #+nil (funcall) #+nil (apply)
              #+nil (tagbody) #+nil (go)
+             #+nil (values)
+             #+nil (multiple-value-bind)
              #+nil (block)
              #+nil (catch)   #+nil (throw)
              #+nil (unwind-protect)
@@ -816,24 +814,20 @@ BOOKTODO: register tracking."
              (t
               (destructuring-bind (name &rest body) expr
                 (if-let ((macro (macro cctx name :if-does-not-exist :continue)))
-                  (compile-expr                        cctx proc block symtab valuep tailp (apply macro body))
-                  (compile-funcall                     cctx proc block symtab valuep tailp name body)))))))))
+                  (compile-expr                        cctx proc block symtab valuep tailp (apply macro body))          ; self
+                  (compile-funcall                     cctx proc block symtab valuep tailp name body)))))))))           ; operators...
 
-;;; leaf emitter, return value is expected to be grafted into another MIR inst 
-(defun compile-constant (cctx proc block symtab valuep tailp expr)
-  (when valuep
-    (make-constant-value :const expr)))
-
-;;; potential leaf emitter, return value might be grafted into another MIR inst 
-(defun compile-symbol-ref (cctx proc block symtab valuep tailp sym)
-  (if-let ((syment (or (locate-sym symtab sym)
-                       (locate-sym (cctx-ggsymtab cctx) sym))))
-    (if (eq :symbol-macro (syment-srctype syment))
-        (compile-expr cctx proc block symtab valuep tailp (funcall (symprop syment 'expander)))
-        (when valuep
-          (make-variable-reference :varname sym)))
-    (with-noted-sexp-path sym
-      (comp-error "undefined variable ~S" sym))))
+;;; Doesn't emit anything.
+(defun compile-define-symbol-macro (cctx name expansion)
+  (let ((preexisting-sym (locate-sym (cctx-ggsymtab cctx) name)))
+    (when preexisting-sym
+      (if (eq :symbol-macro (symentry-srctype preexisting-sym))
+          (note-redefinition name 'define-symbol-macro)
+          (comp-error "In DEFINE-SYMBOL-MACRO: ~S is alredy defined as a ~A"
+                      name (symentry-srctype preexisting-sym))))
+    (let ((sym (or preexisting-sym (insert-sym (cctx-ggsymtab cctx) name))))
+      (setf (symprop sym 'expander)
+            (compile nil `(lambda () ,expansion))))))
 
 (defun compile-defun (cctx name lambda-list body)
   (labels ((validate-lambda-list (list)
@@ -843,115 +837,110 @@ BOOKTODO: register tracking."
                (when-let ((consts (remove-if-not #'const params)))
                  (expr-error "reserved constant names in lambda list: ~S" consts)))))
     (with-noted-sexp-path `(defun ,name ,lambda-list)
-      ;; Make a temporary, incomplete function object for the purpose of recursion, with expression lacking proper code,
-      ;; and type being set to t.
       (multiple-value-bind (docstring declarations body) (destructure-def-body body)
         (lret* ((parameters (validate-lambda-list lambda-list))
                 (proc (make-procedure :name name :lambda-list lambda-list :parameters parameters :nparams (length parameters) :body body
-                                      :documentation docstring :leafp t :complete nil)))
+                                      :documentation docstring :leafp t)))
           (when (proc cctx name)
             (note-redefinition name 'defun))
           (setf (proc cctx name) proc)
           (with-slots (gsymtab) proc
-            (let ((block (make-basic-block proc nil nil)))
+            (let ((block (make-basic-block proc nil nil))
+                  (return-tn (make-variable-reference (symentry-name (allocate-tempvar gsymtab)))))
               (append-to-block block (make-label name))
               (handle-scope-extension cctx gsymtab parameters declarations)
               (dolist (p parameters)
                 (append-to-block block (make-receive p (symentry-type (locate-sym gsymtab p)))))
-              (compile-progn cctx proc block gsymtab nil nil (butlast body))
-              ;; the above can break the block, we need to account for that
-              (append-to-block block (make-return-value (the-mir-operand (compile-expr cctx proc block gsymtab t t (lastcar body)))))
-              (setf (proc-complete proc) t))))))))
+              (append-to-block (nth-value 1 (compile-progn cctx proc block gsymtab return-tn t body))
+                               (make-return-value return-tn)))))))))
 
-(defun compile-funcall (cctx proc block symtab valuep tailp name args)
-  (let ((func (or (proc compenv fname :if-does-not-exist :continue)
-                  (primop fname :if-does-not-exist :continue))))
-    (unless func
-      (expr-error "reference to undefined function ~S" fname))
-    (unless (= (length args) (func-nargs func))
-      (expr-error "wrong argument count in call of ~S: got ~D, expected ~D"
-                  fname (length args) (func-nargs func)))
-    (with-noted-sexp-path `(funcall ,name)
-      (let ((arg-values (mapcar (curry #'compile-expr cctx proc block symtab t nil) args)))
-        (mapc #'the-mir-operand arg-values)
-        (if valuep
-            (lret ((tn (allocate-tempvar symtab)))
-              (append-to-block block (make-call-assignment tn proc arg-values)))
-            (append-to-block block (make-call proc arg-values)))))))
+;;; leaf, doesn't emit anything, return value is expected to be grafted into another MIR inst 
+(defun compile-constant (cctx proc block symtab valuep tailp expr)
+  (declare (ignore cctx proc symtab tailp))
+  (values
+   (cond
+     ((not valuep)                        nil)
+     ((eq valuep t)                       (make-constant-value expr))
+     ((typep valuep 'variable-reference)  (progn
+                                            (append-to-block block (make-value-assignment valuep (make-constant-value expr)))
+                                            nil))
+     (t   
+      (comp-error "in CONSTANT ~A: bad value passing specifier ~S from outer context" expr valuep)))
+   block))
+
+;;; potential leaf emitter, doesn't emit anything by itself
+(defun compile-symbol-ref (cctx proc block symtab valuep tailp sym)
+  (if-let ((syment (or (locate-sym symtab sym)
+                       (locate-sym (cctx-ggsymtab cctx) sym))))
+    (if (eq :symbol-macro (symentry-srctype syment))
+        (compile-expr cctx proc block symtab valuep tailp (funcall (symprop syment 'expander)))
+        (values
+         (cond
+           ((not valuep)                        nil)
+           ((eq valuep t)                       (make-variable-reference sym))
+           ((typep valuep 'variable-reference)  (progn
+                                                  (append-to-block block (make-value-assignment valuep (make-variable-reference sym)))
+                                                  nil))
+           (t   
+            (comp-error "in ~A: bad value passing specifier ~S from outer context" sym valuep)))
+         block))
+    (with-noted-sexp-path sym
+      (comp-error "undefined variable ~S" sym))))
+
+(defun compile-setq (cctx proc block symtab valuep tailp assignment-plist)
+  (values (iter (for (sym expr . rest) on assignment-plist by #'cddr)
+                (if-let ((syment (or (locate-sym symtab sym)
+                                     (locate-sym (cctx-ggsymtab cctx) sym))))
+                  (if (eq :symbol-macro (symentry-srctype syment))
+                      (comp-error "symbol macro assignments not supported")
+                      (let ((target-tn (make-variable-reference sym)))
+                        (multiple-value-bind (result-tn maybe-new-block) (compile-expr cctx proc block symtab target-tn (and rest tailp) expr)
+                          (setf block maybe-new-block)
+                          (when (and valuep (null rest))
+                            (cond ((eq valuep t)                      result-tn)
+                                  ((typep valuep 'variable-reference) (append-to-block block (make-value-assignment valuep result-tn)))
+                                  (t
+                                   (comp-error "in SETQ ~A: bad value passing specifier ~S from outer context" assignment-plist valuep)))))))
+                  (with-noted-sexp-path sym
+                    (comp-error "undefined variable ~S" sym))))
+          block))
+
+(defun compile-symbol-macrolet (cctx proc block symtab valuep tailp bindings body)
+  (let* ((syms (mapcar #'ensure-car bindings))
+         (expansions (mapcar (compose #'second #'ensure-list) bindings))
+         (new-symtab (make-symtab symtab)))
+    (iter (for sym in syms)
+          (for expansion in expansions)
+          (let ((syment (insert-sym new-symtab sym)))
+            (setf (symentry-srctype syment) :symbol-macro
+                  (symprop syment 'expander) (compile nil `(lambda () ,expansion)))))
+    (compile-progn cctx proc block new-symtab valuep tailp body)))
+
+(defun compile-let (cctx proc block symtab valuep tailp bindings body)
+  (let* ((syms (mapcar #'ensure-car bindings))
+         (arg-exprs (mapcar (compose #'second #'ensure-list) bindings))
+         (arg-tns (mapcar #'make-variable-reference syms))
+         (new-symtab (make-symtab symtab)))
+    (multiple-value-bind (declarations body) (destructure-binding-form-body body)
+      (handle-scope-extension cctx new-symtab syms declarations)
+      (iter (for arg-expr in arg-exprs)
+            (for arg-tn in arg-tns)
+            (for (values nil maybe-new-block) = (compile-expr cctx proc block symtab arg-tn nil arg-expr))
+            (setf block maybe-new-block))
+      (compile-progn cctx proc block new-symtab valuep tailp body))))
 
 (defun compile-progn (cctx proc block symtab valuep tailp exprs)
   (if exprs
-      (progn
-        (mapcar (curry #'compile-expr cctx proc block symtab nil nil)
-                (butlast exprs))
-        (compile-expr cctx proc block symtab valuep tailp (lastcar exprs)))
-      (compile-constant cctx proc block symtab valuep tailp nil)))
+      (iter (for expr in (butlast exprs))
+            (setf block (nth-value 1 (compile-expr cctx proc block symtab nil nil expr)))
+            (finally
+             (return (compile-expr cctx proc block symtab valuep tailp (lastcar exprs)))))
+      (values (compile-constant cctx proc block symtab valuep tailp nil)
+              block)))
 
-(defun compile-let (cctx proc block symtab valuep tailp bindings body)
-  (with-noted-sexp-path 'let
-    (let* ((syms (mapcar #'ensure-car bindings))
-           (binding-values (mapcar (curry #'compile-expr cctx proc block symtab t nil) (mapcar #'second bindings)))
-           (new-symtab (make-symtab symtab)))
-      (multiple-value-bind (declarations body) (destructure-binding-form-body body)
-        (handle-scope-extension cctx new-symtab syms declarations)
-        (iter (for sym in syms)
-              (for val in binding-values)
-              (append-to-block block (make-value-assignment sym val)))
-        (compile-progn cctx proc block new-symtab valuep tailp body)))))
-
-(defun compile-if (cctx proc block symtab valuep tailp clauses)
-  (let ((n-args (length clauses)))
-    (when (or (< n-args 2)
-              (> n-args 3))
-      (expr-error "invalid number of elements in IF operator: between 2 and 3 expected")))
-  (destructuring-bind (condition then-clause &optional else-clause) clauses
-    (let* ((condition-code (compile-expr condition compenv lexenv t nil))
-           (then-code (compile-expr then-clause compenv lexenv valuep tailp))
-           (else-code (if else-clause
-                          (compile-expr else-clause compenv lexenv valuep tailp)
-                          (compile-constant nil valuep tailp))))
-      (with-noted-sexp-path 'if
-        (cond ((null condition) else-code)
-              ((constant-p condition) then-code)
-              ((equalp then-clause else-clause) (compile-progn `(,condition ,then-clause) compenv lexenv valuep tailp))
-              ((and (= 2 (length condition)) (eq (first condition) 'not))
-               (compile-if `(if ,(second condition) ,then-clause ,else-clause) compenv lexenv valuep tailp))
-              (t
-               (make-instance 'expr :effect-free effect-free :pure pure :value-used valuep :env lexenv
-                              :type (comp-simplify-logical-expression `(or ,(expr-type then-code) ,(expr-type else-code)))
-                              :form `(if ,condition ,then-clause ,@(when else-clause `(,else-clause)))
-                              :branching (if (find :funcall (list condition-code then-code else-code) :key #'expr-branching)
-                                             :funcall
-                                             :non-tail)
-                              :code
-                              (let ((else-label (gensym (concatenate 'string "IF-NOT")))
-                                    (end-label (gensym (concatenate 'string "IF-END"))))
-                                (append (list (make-instance 'expr :effect-free (expr-effect-free condition-code) :pure (expr-pure condition-code)
-                                                             :value-used t :env lexenv
-                                                             :type 'boolean :form condition
-                                                             :code
-                                                             (append (list condition-code)
-                                                                     (emit-jump-if-not else-label))))
-                                        (list then-code)
-                                        (unless tailp
-                                          (emit-jump end-label))
-                                        (emit-label else-label)
-                                        (list else-code)
-                                        (unless tailp
-                                          (emit-label end-label)))))))))))
-
-(defun compile-symbol-macrolet (cctx proc block symtab valuep tailp bindings body)
-  #+nil (let ((new-symtab (make-symtab )))))
-
-(defun compile-setq (cctx proc block symtab valuep tailp assignment-plist)
-  )
-
-;;;
-;;; IR1
-;;;
-(defun comp-simplify-logical-expression (x &aux (pass-list '(fold-constants remove-duplicates unnest-similars detrivialize recurse)))
+(defun simplify-logical-expression (x &aux (pass-list '(fold-constants remove-duplicates unnest-similars detrivialize recurse)))
   (cond ((atom x) x)
-        ((= 2 (length x)) (comp-simplify-logical-expression (second x)))
+        ((= 2 (length x)) (simplify-logical-expression (second x)))
         (t
          (cons (first x) (let ((state pass-list)
                                (x-body (rest x)))
@@ -963,10 +952,10 @@ BOOKTODO: register tracking."
                                                 (lambda ()
                                                   (ecase (first x)
                                                     (or (if (member t (rest x))
-                                                            (return-from comp-simplify-logical-expression t)
+                                                            (return-from simplify-logical-expression t)
                                                             (remove nil x-body)))
                                                     (and (if (member nil (rest x))
-                                                             (return-from comp-simplify-logical-expression nil)
+                                                             (return-from simplify-logical-expression nil)
                                                              (remove t x-body))))))
                                                (remove-duplicates
                                                 (lambda ()
@@ -984,12 +973,12 @@ BOOKTODO: register tracking."
                                                       x-body)))
                                                (recurse
                                                 (lambda ()
-                                                  (mapcar #'comp-simplify-logical-expression x-body))))))
+                                                  (mapcar #'simplify-logical-expression x-body))))))
                                   (if xform
                                       (multiple-value-bind (processed-x-body trivial-p) (funcall xform)
                                         (cond (trivial-p
-                                               (return-from comp-simplify-logical-expression
-                                                 (comp-simplify-logical-expression processed-x-body)))
+                                               (return-from simplify-logical-expression
+                                                 (simplify-logical-expression processed-x-body)))
                                               ((equalp processed-x-body x-body)
                                                (setf state (cdr state)))
                                               (t
@@ -997,6 +986,68 @@ BOOKTODO: register tracking."
                                                      x-body processed-x-body)))
                                         (go loop))
                                       (return-from machine-collector x-body))))))))))
+
+(defun compile-funcall (cctx proc block symtab valuep tailp name arg-exprs)
+  (declare (ignore tailp))
+  (let ((func (or (proc cctx name :if-does-not-exist :continue)
+                  (primop name :if-does-not-exist :continue))))
+    (unless func
+      (expr-error "reference to undefined function ~S" name))
+    (unless (= (length arg-exprs) (proc-nparams func))
+      (expr-error "wrong argument count in call of ~S: got ~D, expected ~D"
+                  name (length arg-exprs) (proc-nparams func)))
+    (with-noted-sexp-path `(funcall ,name)
+      (let ((arg-mir-insts (iter (for arg-expr in arg-exprs)
+                                 (for (values result maybe-new-block) = (compile-expr cctx proc block symtab t nil arg-expr))
+                                 (setf block maybe-new-block)
+                                 (collect result))))
+        (values
+         (cond
+           ((not valuep)                        (progn
+                                                  (append-to-block block (make-call proc arg-mir-insts)) 
+                                                  nil))
+           ((eq valuep t)                       (lret ((tn (make-variable-reference (symentry-name (allocate-tempvar symtab)))))
+                                                  (append-to-block block (make-call-assignment tn name arg-mir-insts))))
+           ((typep valuep 'variable-reference)  (prog1 valuep
+                                                  (append-to-block block (make-call-assignment valuep name arg-mir-insts))))
+           (t   
+            (comp-error "in COMPILE-FUNCALL (~A ...): bad value passing specifier ~S from outer context" name valuep)))
+         block)))))
+
+(defun compile-if (cctx proc block symtab valuep tailp clauses)
+  (let ((n-args (length clauses)))
+    (when (or (< n-args 2)
+              (> n-args 3))
+      (expr-error "invalid number of elements in IF operator: between 2 and 3 expected")))
+  (destructuring-bind (condition then-clause &optional else-clause) clauses
+    (let* ((condition-code (compile-expr cctx proc block symtab t nil condition))
+           (then-code (compile-expr cctx proc block symtab valuep nil then-clause))
+           (else-code (if else-clause
+                          (compile-expr cctx proc block symtab valuep nil else-clause)
+                          (compile-constant cctx proc block symtab valuep tailp nil))))
+      (with-noted-sexp-path 'if
+        (cond ((null condition) else-code)
+              ((constant-p condition) then-code)
+              ((equalp then-clause else-clause) (compile-progn cctx proc block symtab valuep tailp `(,condition ,then-clause)))
+              ((and (= 2 (length condition)) (eq (first condition) 'not))
+               (compile-if cctx proc block symtab valuep tailp `(if ,(second condition) ,then-clause ,else-clause)))
+              (t
+               #+nil
+               (let ((else-label (gensym (concatenate 'string "IF-NOT")))
+                     (end-label (gensym (concatenate 'string "IF-END"))))
+                 (append (list (make-instance 'expr :effect-free (expr-effect-free condition-code) :pure (expr-pure condition-code)
+                                              :value-used t :env lexenv
+                                              :type 'boolean :form condition
+                                              :code
+                                              (append (list condition-code)
+                                                      (emit-jump-if-not else-label))))
+                         (list then-code)
+                         (unless tailp
+                           (emit-jump end-label))
+                         (emit-label else-label)
+                         (list else-code)
+                         (unless tailp
+                           (emit-label end-label))))))))))
 
 ;; (defun comp-typep (x type)
 ;;   (if (consp type)
