@@ -70,6 +70,141 @@
 (defun make-lir-operand (regname value typename) (make-instance 'lir-operand :regname regname :value value :typename typename))
 
 ;;;;
+;;;; Context
+;;;;
+(defstruct (symtab (:constructor %make-symtab (parent)))
+  (parent nil :type (or null symtab))
+  (syms (make-hash-table :test 'equal) :type hash-table)
+  (temporary-counter 0 :type fixnum)
+  (childs nil :type list))
+
+(defclass ccontext (language architecture)
+  ((types      :reader cctx-types       :initform (make-hash-table :test 'eq))
+   (procs      :reader cctx-procs       :initform (make-hash-table :test 'eq))
+   (macros     :reader cctx-macros      :initform (make-hash-table :test 'eq))
+   (compmacros :reader cctx-compmacros  :initform (make-hash-table :test 'eq))
+   (ggsymtab   :accessor cctx-ggsymtab  :initarg :ggsymtab)
+   ;; storage
+   (staticloc  :accessor cctx-staticloc :initarg :staticloc))
+  (:default-initargs 
+   :ggsymtab (make-symtab)
+   :staticloc 0))
+
+;;;;
+;;;; Types
+;;;;
+(defclass typoid ()
+  ((name :reader type-name :initarg :name)
+   (supers :reader type-supers :initarg :supers)
+   (subs :reader type-subs :initarg :subs)
+   (exhausted-p :accessor type-exhausted-p :initarg :exhausted-p))
+  (:default-initargs :supers nil :subs nil :exhausted-p nil))
+
+(defmacro define-typoid (name supers slots &rest class-options)
+  `(progn
+     (defclass ,name ,supers
+       ,(iter (for slot in slots)
+              (collect `(,slot :reader ,(format-symbol (symbol-package name) "TYPE-~A" slot)
+                               :initarg ,(make-keyword slot))))
+       ,@class-options)
+     (defun ,(format-symbol (symbol-package name) "DEFINE-~A" name)
+         (name &optional supers ,@slots &rest initargs &key &allow-other-keys)
+       (apply #'define-fundamental-type ',name name supers
+              ,@(iter (for slot in slots)
+                      (collect (make-keyword slot))
+                      (collect slot))
+              initargs))))
+
+;;; ATOMICS
+(define-typoid atomic-type (typoid) ())
+
+(define-typoid numeric-type (atomic-type)
+  (storage-size))
+(define-typoid integer-type (numeric-type)
+  (lower-bound upper-bound))
+
+;;; COMPOUNDS
+(defclass compound-type (typoid) ())
+
+(defclass variable-size-compound (compound-type) ())
+(defclass fixed-size-compound (compound-type)
+  ((strength :reader type-strength :initarg :arity)))
+(defclass dimensional-compound (compound-type)
+  ((arity :reader type-arity :initarg :arity)))
+
+(defclass homogenous-compound-type (compound-type)
+  ((base :reader type-base :initarg :base)))
+(defclass heterogenous-compound-type (compound-type)
+  ((bases :reader type-bases :initarg :bases)))
+
+(define-typoid structured-type (fixed-size-compound heterogenous-compound-type)
+  (slot-names))
+(define-typoid tuple-type (fixed-size-compound heterogenous-compound-type) ())
+(define-typoid fixed-array-type (dimensional-compound fixed-size-compound uniform-compound-type) ())
+(define-typoid fixed-vector-type (fixed-array-type)
+  ()
+  (:default-initargs :arity 1))
+(define-typoid variable-array-type (dimensional-compound variable-size-compound uniform-compound-type)
+  ())
+(define-typoid variable-vector-type (variable-array-type)
+  ()
+  (:default-initargs :arity 1))
+
+(defun make-type (type name supers &rest initargs &key &allow-other-keys)
+  (apply #'make-instance type :name name :supers supers initargs))
+
+(defvar *fundamental-types* (make-hash-table :test 'eq)
+  "Fundamental types, common to everything sensible.")
+
+(define-subcontainer %find-type :container-slot types :type typoid)
+(define-root-container *fundamental-types* %find-fundamental-type :type typoid)
+
+(defgeneric find-type (context name)
+  (:method ((empty null) name)
+    (%find-fundamental-type name))
+  (:method ((o ccontext) name)
+    (or (%find-type o name)
+        (%find-fundamental-type name))))
+
+(defgeneric coerce-to-type (x)
+  (:method ((o typoid)) o)
+  (:method ((o cl:symbol)) (find-type nil o)))
+
+(defun define-fundamental-type (type name &optional supers &rest initargs &key &allow-other-keys)
+  (let ((type (apply #'make-type type name (mapcar #'coerce-to-type supers) initargs)))
+    (setf (%find-fundamental-type name) type)
+    (dolist (super (type-supers type))
+      (push type (slot-value super 'subs)))))
+
+(define-numeric-type :number)
+(define-numeric-type :real                '(:number))
+
+(define-numeric-type :float               '(:real))
+(define-numeric-type :single-float        '(:float) 32)
+(define-numeric-type :double-float        '(:float) 64)
+(define-numeric-type :quad-float          '(:float) 128)
+
+(define-numeric-type :integer             '(:real))
+(define-integer-type :unsigned-integer    '(:integer))
+(define-integer-type :signed-integer      '(:integer))
+
+(define-integer-type :unsigned-byte       '(:unsigned-integer) 0                                   #xff                               :storage-size 8)
+(define-integer-type :signed-byte         '(:signed-integer)   #x-7f                               #x80                               :storage-size 8)
+(define-integer-type :unsigned-word       '(:unsigned-integer) 0                                   #xffff                             :storage-size 16)
+(define-integer-type :signed-word         '(:signed-integer)   #x-7fff                             #x8000                             :storage-size 16)
+(define-integer-type :unsigned-short      '(:unsigned-integer) 0                                   #xffffffff                         :storage-size 32)
+(define-integer-type :signed-short        '(:signed-integer)   #x-7fffffff                         #x80000000                         :storage-size 32)
+(define-integer-type :unsigned-doubleword '(:unsigned-integer) 0                                   #xffffffffffffffff                 :storage-size 64)
+(define-integer-type :signed-doubleword   '(:signed-integer)   #x-7fffffffffffffff                 #x8000000000000000                 :storage-size 64)
+(define-integer-type :unsigned-quadword   '(:unsigned-integer) 0                                   #xffffffffffffffffffffffffffffffff :storage-size 128)
+(define-integer-type :signed-quadword     '(:signed-integer)   #x-7fffffffffffffffffffffffffffffff #x80000000000000000000000000000000 :storage-size 128)
+
+(define-atomic-type :character)
+
+(define-structured-type :structure)
+
+
+;;;;
 ;;;; Operators
 ;;;;
 (defclass operator ()
@@ -94,33 +229,44 @@
 (defmacro define-unary-operator (sym short-name name)  `(define-operator ,sym ,short-name 1 ,name))
 (defmacro define-binary-operator (sym short-name name) `(define-operator ,sym ,short-name 2 ,name))
 
+;;; any-real -> any-real
 (define-binary-operator + :add add)
 (define-binary-operator - :sub subtract)
 (define-binary-operator * :mul multiply)
 (define-binary-operator / :div divide)
-(define-binary-operator mod :mod modulo)
-(define-binary-operator min :min minumum)
-(define-binary-operator max :max maximum)
-(define-binary-operator = :eql equality)
-(define-binary-operator != :neql not-equal)
+(define-unary-operator  - :neg arithmetic-negation)
+;;; any-real -> boolean
 (define-binary-operator < :less less-than)
 (define-binary-operator <= :lseq less-or-equal)
 (define-binary-operator > :grtr greater-than)
 (define-binary-operator >= :gteq greater-of-equal)
+(define-binary-operator = :eql equality)                                 ; incl pointers
+(define-binary-operator != :neql not-equal)                              ; incl pointers
+;;; boolean -> boolean
+(define-unary-operator  ! :not logic-negation)
+;;; integer -> integer
+(define-binary-operator mod :mod modulo)
+(define-binary-operator min :min minumum)
+(define-binary-operator max :max maximum)
 (define-binary-operator shl :shl shift-left)
 (define-binary-operator shr :shr shift-right)
 (define-binary-operator shra :shra shift-right-arithmetic)
 (define-binary-operator and :and logical-and)
 (define-binary-operator or :or logical-or)
 (define-binary-operator xor :xor logical-exclusive-or)
+;;; pointer -> any-real
 (define-unary-operator  * :ind indirection)
+;;; structure -> any
 (define-binary-operator >. :elt element)
+;;; pointer structure -> any
 (define-binary-operator *. :indelt element-indirection)
-(define-unary-operator  - :neg arithmetic-negation)
-(define-unary-operator  ! :not logic-negation)
+;;; any -> pointer
 (define-unary-operator  addr :addr address-of)
-(define-unary-operator  val :val value)
+;;; any -> any
 (define-binary-operator cast :cast cast)
+;;; ???
+(define-unary-operator  val :val value)
+;;; ???
 (define-binary-operator lind :lind indirect-assignment)
 (define-binary-operator lcond :lcond conditional-assignment)
 (define-binary-operator lindelt :lindelt indirect-element-assignment)
@@ -378,12 +524,6 @@
          (with-slots ,direct ,entry
            ,@body)))))
 
-(defstruct (symtab (:constructor %make-symtab (parent)))
-  (parent nil :type (or null symtab))
-  (syms (make-hash-table :test 'equal) :type hash-table)
-  (temporary-counter 0 :type fixnum)
-  (childs nil :type list))
-
 (define-subcontainer locate-sym :container-slot syms :key-type string :type symentry :if-exists :continue :if-does-not-exist :continue
                      :iterator do-symtab-entries)
 
@@ -525,19 +665,6 @@ assigns a displacement and the frame pointer as the base register."
   (depth)
   (blocks (make-array 0 :element-type 'basic-block :adjustable t) :type vector)
   (lblocks (make-array 0 :element-type 'basic-block :adjustable t) :type vector))
-
-(defclass ccontext (language architecture)
-  ((staticloc :accessor cctx-staticloc :initarg :staticloc)
-   (ggsymtab :accessor cctx-ggsymtab :initarg :ggsymtab)
-   (procs :reader cctx-procs :initarg :procs)
-   (macros :reader cctx-macros :initarg :macros)
-   (compmacros :reader cctx-compmacros :initarg :compmacros))
-  (:default-initargs
-   :staticloc 0 
-   :ggsymtab (make-symtab)
-   :procs (make-hash-table :test 'eq)
-   :macros (make-hash-table :test 'eq)
-   :compmacros (make-hash-table :test 'eq)))
 
 (define-subcontainer proc :type procedure :iterator do-procs :container-slot procs)
 (define-subcontainer macro :type function :iterator do-macros :container-slot macros)
