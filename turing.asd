@@ -1,7 +1,7 @@
 ;;; -*- Mode: Lisp; indent-tabs-mode: nil -*-
 
 (defsystem :turing
-  :depends-on (:alexandria :iterate :pergamum :assem)
+  :depends-on (:alexandria :iterate :pergamum :semi-precious :assem)
   :components
   ((:file "package")
    ;;;

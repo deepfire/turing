@@ -174,7 +174,7 @@
   (declare (optimize (speed 0) (space 0) (debug 3) (safety 3)))
   (let* ((dis (make-extent 'disivec (ash (base ivec) -2) ;; the assumption for fixed-opcode-length 32bit arch..
                            (coerce (disassemble isa ivec) 'vector)))
-         (tree (octree-1d:make-tree :start (1- (base dis)) :length (+ (size dis) 2)))
+         (tree (intree:make-tree :start (1- (base dis)) :length (+ (size dis) 2)))
          roots forwards)
     (labels ((insn (i)
                (destructuring-bind (opcode width insn . params) (aref (extent-data dis) (- i (base dis)))
@@ -193,8 +193,8 @@
                       &allow-other-keys)
                (declare (type integer start end))
                (lret ((bb (apply #'make-instance 'bb :base start :data data (remove-from-plist rest :data))))
-                 (octree-1d:insert start bb tree)))
-             (new-pseudo-bb (mnemonics at) (lret ((bb (make-pseudo-bb mnemonics at))) (octree-1d:insert at bb tree)))
+                 (intree:insert start bb tree)))
+             (new-pseudo-bb (mnemonics at) (lret ((bb (make-pseudo-bb mnemonics at))) (intree:insert at bb tree)))
              (new-linked-bb (chain-bb start end)
                "Create and chain/insert a BB START<->END, if only its length would be positive."
                (declare (type (or null bb) chain-bb) (type (integer 0) start end))
@@ -280,7 +280,7 @@
                          ;; (format t "pushing a forward: ~X -> ~X~%" (base bb) target)
                          (push (list target bb) forwards))
                         ((< delta 0) ;; a back reference...
-                         (let* ((target-bb (oct-1d:tree-left target tree))
+                         (let* ((target-bb (intree:tree-left target tree))
                                 (split-p (not (= target (base target-bb))))
                                 (link-target-bb (if split-p
                                                     (flow-split-bb-at target-bb target)
@@ -299,17 +299,17 @@
               (setf bb-start (+ outgoing 1 (isa-delay-slots isa))))
         (when forwards
           (format t "unresolved forwards: ~S, ~S~%" (length forwards) (mapcar #'car forwards)))
-        (values (oct-1d:tree-list tree) tree)))))
+        (values (intree:tree-list tree) tree)))))
 
 (defun bbnet-tree (bbnet)
-  "Reconstruct the octree for the BB netlist."
+  "Reconstruct the intree for the BB netlist."
   (lret (tree)
     (iter (for bb in bbnet)
           (minimize (base bb) into base)
           (maximize (end bb) into end)
-          (finally (setf tree (oct-1d:make-tree :start base :length (- end base)))))
+          (finally (setf tree (intree:make-tree :start base :length (- end base)))))
     (iter (for bb in bbnet)
-        (oct-1d:insert (base bb) bb tree))))
+        (intree:insert (base bb) bb tree))))
 
 (defun check-graph-validity (nodelist node-ins-fn node-outs-fn)
   "Validate NODELIST as a complete list of doubly-linked graph nodes, 
